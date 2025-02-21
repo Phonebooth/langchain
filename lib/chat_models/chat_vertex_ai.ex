@@ -123,15 +123,13 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   end
 
   def for_api(%ChatVertexAI{} = vertex_ai, messages, functions) do
-    sys_instructions = messages |> Enum.find(fn x -> x.role == :system end) |> List.wrap()
-    other_messages = Enum.reject(messages, fn x -> x in sys_instructions end) |> List.wrap()
+    {sys_instructions, other_messages} = Utils.split_system_message(messages)
 
     messages_for_api =
       other_messages
       |> Enum.map(&for_api/1)
       |> List.flatten()
       |> List.wrap()
-
 
     req = %{
       "contents" => messages_for_api,
@@ -141,18 +139,7 @@ defmodule LangChain.ChatModels.ChatVertexAI do
         "topK" => vertex_ai.top_k
       }
     }
-
-    req =
-      if length(sys_instructions) == 1 do
-        sys_instruction =
-          sys_instructions
-          |> List.first()
-          |> for_api()
-        req
-        |> Map.put("system_instruction", sys_instruction)
-      else
-        req
-      end
+    |> Utils.conditionally_add_to_map("system_instruction", sys_instructions)
 
     req =
       if vertex_ai.json_response do
@@ -250,6 +237,8 @@ defmodule LangChain.ChatModels.ChatVertexAI do
       }
     }
   end
+
+  defp for_api(nil), do: nil
 
   @doc """
   Calls the Google AI API passing the ChatVertexAI struct with configuration,
