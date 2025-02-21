@@ -123,8 +123,8 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   end
 
   def for_api(%ChatVertexAI{} = vertex_ai, messages, functions) do
-    sys_instructions = messages |> Enum.find(fn x -> x.role == :system end)
-    other_messages = Enum.reject(messages, fn x -> x in sys_instructions end)
+    sys_instructions = messages |> Enum.find(fn x -> x.role == :system end) |> List.wrap()
+    other_messages = Enum.reject(messages, fn x -> x in sys_instructions end) |> List.wrap()
 
     messages_for_api =
       other_messages
