@@ -139,7 +139,7 @@ defmodule LangChain.ChatModels.ChatVertexAI do
         "topK" => vertex_ai.top_k
       }
     }
-    |> Utils.conditionally_add_to_map("system_instruction", sys_instructions)
+    |> Utils.conditionally_add_to_map("system_instruction", for_api(sys_instructions))
 
     req =
       if vertex_ai.json_response do
