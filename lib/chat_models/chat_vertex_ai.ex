@@ -326,9 +326,7 @@ defmodule LangChain.ChatModels.ChatVertexAI do
 
     req =
       if vertex_ai.headers do
-        header_names = Map.keys(vertex_ai.headers)
-        header_vals = Map.values(vertex_ai.headers)
-        headers = Enum.zip(header_names, header_vals)
+        headers = Map.to_list(vertex_ai.headers)
         Req.Request.put_headers(req, headers)
     else
       req
