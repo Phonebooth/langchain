@@ -1,6 +1,7 @@
 defmodule ChatModels.ChatVertexAITest do
   alias LangChain.ChatModels.ChatVertexAI
   use LangChain.BaseCase
+  use Mimic
 
   doctest LangChain.ChatModels.ChatVertexAI
   alias LangChain.ChatModels.ChatVertexAI
@@ -11,6 +12,9 @@ defmodule ChatModels.ChatVertexAITest do
   alias LangChain.MessageDelta
   alias LangChain.Function
   alias LangChain.LangChainError
+  alias LangChain.TokenUsage
+
+  @test_model "gemini-2.5-flash"
 
   setup do
     {:ok, hello_world} =
@@ -20,45 +24,163 @@ defmodule ChatModels.ChatVertexAITest do
         function: fn _args, _context -> {:ok, "Hello world!"} end
       })
 
-    %{hello_world: hello_world}
+    model =
+      ChatVertexAI.new!(%{
+        "model" => @test_model,
+        "endpoint" => "http://localhost:1234/"
+      })
+
+    %{model: model, hello_world: hello_world}
   end
 
   describe "new/1" do
     test "works with minimal attr" do
       assert {:ok, %ChatVertexAI{} = vertex_ai} =
-               ChatVertexAI.new(%{
-                 "model" => "gemini-pro",
-                 "endpoint" => "http://localhost:1234/"
-               })
+               ChatVertexAI.new(%{"model" => @test_model, "endpoint" => "http://localhost:1234/"})
 
-      assert vertex_ai.model == "gemini-pro"
+      assert vertex_ai.model == @test_model
     end
 
     test "returns error when invalid" do
-      assert {:error, changeset} = ChatVertexAI.new(%{"model" => nil})
+      assert {:error, changeset} = ChatVertexAI.new(%{"model" => nil, "endpoint" => nil})
       refute changeset.valid?
       assert {"can't be blank", _} = changeset.errors[:model]
+    end
+
+    test "supports overriding the API endpoint" do
+      override_url = "http://localhost:1234/"
+
+      model =
+        ChatVertexAI.new!(%{
+          model: @test_model,
+          endpoint: override_url
+        })
+
+      assert model.endpoint == override_url
+    end
+
+    test "supports setting json_response and json_schema" do
+      json_schema = %{
+        "type" => "object",
+        "properties" => %{
+          "name" => %{"type" => "string"},
+          "age" => %{"type" => "integer"}
+        }
+      }
+
+      {:ok, vertex_ai} =
+        ChatVertexAI.new(%{
+          "model" => @test_model,
+          "endpoint" => "http://localhost:1234/",
+          "json_response" => true,
+          "json_schema" => json_schema
+        })
+
+      assert vertex_ai.json_response == true
+      assert vertex_ai.json_schema == json_schema
     end
   end
 
   describe "for_api/3" do
     setup do
-      {:ok, vertex_ai} =
-        ChatVertexAI.new(%{
-          "model" => "gemini-pro",
-          "endpoint" => "http://localhost:1234/",
-          "temperature" => 1.0,
-          "top_p" => 1.0,
-          "top_k" => 1.0
-        })
+      params = %{
+        "model" => @test_model,
+        "endpoint" => "http://localhost:1234/",
+        "temperature" => 1.0,
+        "top_p" => 1.0,
+        "top_k" => 1.0
+      }
 
-      %{vertex_ai: vertex_ai}
+      {:ok, vertex_ai} = ChatVertexAI.new(params)
+
+      %{vertex_ai: vertex_ai, params: params}
     end
 
     test "generates a map for an API call", %{vertex_ai: vertex_ai} do
       data = ChatVertexAI.for_api(vertex_ai, [], [])
       assert %{"contents" => [], "generationConfig" => config} = data
       assert %{"temperature" => 1.0, "topK" => 1.0, "topP" => 1.0} = config
+    end
+
+    test "generate a map containing a text, inline image, and image url parts", %{
+      vertex_ai: google_ai
+    } do
+      messages = [
+        %LangChain.Message{
+          content:
+            "You are an expert at providing an image description for assistive technology and SEO benefits.",
+          role: :system
+        },
+        %LangChain.Message{
+          content: [
+            %LangChain.Message.ContentPart{
+              type: :text,
+              content: "This is the text."
+            },
+            %LangChain.Message.ContentPart{
+              type: :image,
+              content: "/9j/4AAQSkz",
+              options: [media: "image/jpeg"]
+            },
+            %LangChain.Message.ContentPart{
+              type: :image_url,
+              content: "http://localhost:1234/image.jpg",
+              options: [media: "image/jpeg"]
+            }
+          ],
+          role: :user
+        }
+      ]
+
+      data = ChatVertexAI.for_api(google_ai, messages, [])
+      assert %{"contents" => [msg1]} = data
+
+      assert %{
+               "parts" => [
+                 %{
+                   "text" => "This is the text."
+                 },
+                 %{
+                   "inlineData" => %{
+                     "mimeType" => "image/jpeg",
+                     "data" => "/9j/4AAQSkz"
+                   }
+                 },
+                 %{
+                   "fileData" => %{
+                     "fileUri" => "http://localhost:1234/image.jpg",
+                     "mimeType" => "image/jpeg"
+                   }
+                 }
+               ]
+             } = msg1
+    end
+
+    test "support file_url", %{vertex_ai: google_ai} do
+      message =
+        Message.new_user!([
+          ContentPart.text!("User prompt"),
+          ContentPart.file_url!("example.com/test.pdf", media: "application/pdf")
+        ])
+
+      data = ChatVertexAI.for_api(google_ai, [message], [])
+
+      assert %{
+               "contents" => [
+                 %{
+                   "parts" => [
+                     %{"text" => "User prompt"},
+                     %{
+                       "fileData" => %{
+                         "fileUri" => "example.com/test.pdf",
+                         "mimeType" => "application/pdf"
+                       }
+                     }
+                   ],
+                   "role" => :user
+                 }
+               ]
+             } = data
     end
 
     test "generates a map containing user and assistant messages", %{vertex_ai: vertex_ai} do
@@ -78,6 +200,22 @@ defmodule ChatModels.ChatVertexAITest do
       assert %{"contents" => [msg1, msg2]} = data
       assert %{"role" => :user, "parts" => [%{"text" => ^user_message}]} = msg1
       assert %{"role" => :model, "parts" => [%{"text" => ^assistant_message}]} = msg2
+    end
+
+    test "generated a map containing response_mime_type and response_schema", %{params: params} do
+      vertex_ai =
+        params
+        |> Map.merge(%{"json_response" => true, "json_schema" => %{"type" => "object"}})
+        |> ChatVertexAI.new!()
+
+      data = ChatVertexAI.for_api(vertex_ai, [], [])
+
+      assert %{
+               "generationConfig" => %{
+                 "response_mime_type" => "application/json",
+                 "response_schema" => %{"type" => "object"}
+               }
+             } = data
     end
 
     test "generates a map containing function and function call messages", %{vertex_ai: vertex_ai} do
@@ -163,7 +301,7 @@ defmodule ChatModels.ChatVertexAITest do
   end
 
   describe "do_process_response/2" do
-    test "handles receiving a message" do
+    test "handles receiving a message", %{model: model} do
       response = %{
         "candidates" => [
           %{
@@ -174,14 +312,14 @@ defmodule ChatModels.ChatVertexAITest do
         ]
       }
 
-      assert [%Message{} = struct] = ChatVertexAI.do_process_response(response)
+      assert [%Message{} = struct] = ChatVertexAI.do_process_response(model, response)
       assert struct.role == :assistant
       [%ContentPart{type: :text, content: "Hello User!"}] = struct.content
       assert struct.index == 0
       assert struct.status == :complete
     end
 
-    test "error if receiving non-text content" do
+    test "error if receiving non-text content", %{model: model} do
       response = %{
         "candidates" => [
           %{
@@ -192,12 +330,14 @@ defmodule ChatModels.ChatVertexAITest do
         ]
       }
 
-      assert [{:error, %LangChainError{} = error}] = ChatVertexAI.do_process_response(response)
+      assert [{:error, %LangChainError{} = error}] =
+               ChatVertexAI.do_process_response(model, response)
+
       assert error.type == "changeset"
       assert error.message == "role: is invalid"
     end
 
-    test "handles receiving function calls" do
+    test "handles receiving function calls", %{model: model} do
       args = %{"args" => "data"}
 
       response = %{
@@ -213,7 +353,7 @@ defmodule ChatModels.ChatVertexAITest do
         ]
       }
 
-      assert [%Message{} = struct] = ChatVertexAI.do_process_response(response)
+      assert [%Message{} = struct] = ChatVertexAI.do_process_response(model, response)
       assert struct.role == :assistant
       assert struct.index == 0
       [call] = struct.tool_calls
@@ -221,7 +361,7 @@ defmodule ChatModels.ChatVertexAITest do
       assert call.arguments == args
     end
 
-    test "handles receiving MessageDeltas as well" do
+    test "handles receiving MessageDeltas as well", %{model: model} do
       response = %{
         "candidates" => [
           %{
@@ -235,14 +375,16 @@ defmodule ChatModels.ChatVertexAITest do
         ]
       }
 
-      assert [%MessageDelta{} = struct] = ChatVertexAI.do_process_response(response, MessageDelta)
+      assert [%MessageDelta{} = struct] =
+               ChatVertexAI.do_process_response(model, response, MessageDelta)
+
       assert struct.role == :assistant
       assert struct.content == "This is the first part of a mes"
       assert struct.index == 0
       assert struct.status == :incomplete
     end
 
-    test "handles API error messages" do
+    test "handles API error messages", %{model: model} do
       response = %{
         "error" => %{
           "code" => 400,
@@ -251,24 +393,64 @@ defmodule ChatModels.ChatVertexAITest do
         }
       }
 
-      assert {:error, error_string} = ChatVertexAI.do_process_response(response)
+      assert {:error, error_received} = ChatVertexAI.do_process_response(model, response)
+      assert %LangChainError{message: error_string} = error_received
       assert error_string == "Invalid request"
+      assert error_received.original == response
     end
 
-    test "handles Jason.DecodeError" do
+    test "handles Jason.DecodeError", %{model: model} do
       response = {:error, %Jason.DecodeError{}}
 
-      assert {:error, %LangChainError{} = error} = ChatVertexAI.do_process_response(response)
+      assert {:error, %LangChainError{} = error} =
+               ChatVertexAI.do_process_response(model, response)
 
       assert error.type == "invalid_json"
       assert "Received invalid JSON:" <> _ = error.message
     end
 
-    test "handles unexpected response with error" do
+    test "handles unexpected response with error", %{model: model} do
       response = %{}
-      assert {:error, %LangChainError{} = error} = ChatVertexAI.do_process_response(response)
+
+      assert {:error, %LangChainError{} = error} =
+               ChatVertexAI.do_process_response(model, response)
+
       assert error.type == "unexpected_response"
       assert error.message == "Unexpected response"
+    end
+
+    test "handles receiving a message with token usage", %{model: model} do
+      response = %{
+        "candidates" => [
+          %{
+            "content" => %{"role" => "model", "parts" => [%{"text" => "Hello User!"}]},
+            "finishReason" => "STOP",
+            "index" => 0
+          }
+        ],
+        "usageMetadata" => %{
+          "promptTokenCount" => 10,
+          "candidatesTokenCount" => 5,
+          "totalTokenCount" => 15
+        }
+      }
+
+      assert [%Message{} = struct] = ChatVertexAI.do_process_response(model, response)
+      assert struct.role == :assistant
+      [%ContentPart{type: :text, content: "Hello User!"}] = struct.content
+      assert struct.index == 0
+      assert struct.status == :complete
+
+      # Verify that token usage is properly included in metadata
+      assert %TokenUsage{} = struct.metadata.usage
+      assert struct.metadata.usage.input == 10
+      assert struct.metadata.usage.output == 5
+
+      assert struct.metadata.usage.raw == %{
+               "promptTokenCount" => 10,
+               "candidatesTokenCount" => 5,
+               "totalTokenCount" => 15
+             }
     end
   end
 
@@ -305,6 +487,22 @@ defmodule ChatModels.ChatVertexAITest do
     end
   end
 
+  describe "filter_text_parts/1" do
+    test "returns only text parts that are not nil or empty" do
+      parts = [
+        %{"text" => "I have text"},
+        %{"text" => nil},
+        %{"text" => ""},
+        %{"text" => "I have more text"}
+      ]
+
+      assert ChatVertexAI.filter_text_parts(parts) == [
+               %{"text" => "I have text"},
+               %{"text" => "I have more text"}
+             ]
+    end
+  end
+
   describe "get_message_contents/1" do
     test "returns basic text as a ContentPart" do
       message = Message.new_user!("Howdy!")
@@ -332,7 +530,7 @@ defmodule ChatModels.ChatVertexAITest do
 
   describe "serialize_config/2" do
     test "does not include the API key or callbacks" do
-      model = ChatVertexAI.new!(%{model: "gemini-pro", endpoint: "http://localhost:1234/"})
+      model = ChatVertexAI.new!(%{model: @test_model, endpoint: "http://localhost:1234/"})
       result = ChatVertexAI.serialize_config(model)
       assert result["version"] == 1
       refute Map.has_key?(result, "api_key")
@@ -342,7 +540,7 @@ defmodule ChatModels.ChatVertexAITest do
     test "creates expected map" do
       model =
         ChatVertexAI.new!(%{
-          model: "gemini-pro",
+          model: @test_model,
           endpoint: "http://localhost:1234/"
         })
 
@@ -350,16 +548,200 @@ defmodule ChatModels.ChatVertexAITest do
 
       assert result == %{
                "endpoint" => "http://localhost:1234/",
-               "model" => "gemini-pro",
+               "model" => @test_model,
                "module" => "Elixir.LangChain.ChatModels.ChatVertexAI",
                "receive_timeout" => 60000,
+               "thinking_config" => nil,
                "stream" => false,
                "temperature" => 0.9,
                "top_k" => 1.0,
                "top_p" => 1.0,
                "version" => 1,
-               "json_response" => false
+               "json_response" => false,
+               "json_schema" => nil
              }
+    end
+  end
+
+  describe "inspect" do
+    test "redacts the API key" do
+      chain = ChatVertexAI.new!(%{"model" => @test_model, "endpoint" => "http://localhost:1000"})
+
+      changeset = Ecto.Changeset.cast(chain, %{api_key: "1234567890"}, [:api_key])
+
+      refute inspect(changeset) =~ "1234567890"
+      assert inspect(changeset) =~ "**redacted**"
+    end
+  end
+
+  describe "live tests and token usage information" do
+    @tag live_call: true, live_vertex_ai: true
+    test "basic non-streamed response works and fires token usage callback" do
+      handlers = %{
+        on_llm_token_usage: fn usage ->
+          send(self(), {:fired_token_usage, usage})
+        end
+      }
+
+      %ChatVertexAI{} =
+        chat =
+        ChatVertexAI.new!(%{
+          model: "gemini-2.5-flash",
+          temperature: 0,
+          endpoint: System.fetch_env!("VERTEX_API_ENDPOINT"),
+          stream: false
+        })
+
+      chat = %ChatVertexAI{chat | callbacks: [handlers]}
+
+      {:ok, result} =
+        ChatVertexAI.call(chat, [
+          Message.new_user!("Return the response 'Colorful Threads'.")
+        ])
+
+      assert [
+               %Message{
+                 content: [
+                   %Message.ContentPart{
+                     type: :text,
+                     content: "Colorful Threads",
+                     options: []
+                   }
+                 ],
+                 status: :complete,
+                 role: :assistant,
+                 index: nil,
+                 tool_calls: [],
+                 metadata: %{
+                   usage: %TokenUsage{
+                     input: 7,
+                     output: 2
+                   }
+                 }
+               }
+             ] = result
+
+      assert_received {:fired_token_usage, usage}
+      assert %TokenUsage{input: 7, output: 2} = usage
+    end
+
+    @tag live_call: true, live_vertex_ai: true
+    test "streamed response works and fires token usage callback" do
+      handlers = %{
+        on_llm_token_usage: fn usage ->
+          send(self(), {:fired_token_usage, usage})
+        end
+      }
+
+      %ChatVertexAI{} =
+        chat =
+        ChatVertexAI.new!(%{
+          model: "gemini-2.5-flash",
+          temperature: 0,
+          endpoint: System.fetch_env!("VERTEX_API_ENDPOINT"),
+          stream: true
+        })
+
+      chat = %ChatVertexAI{chat | callbacks: [handlers]}
+
+      {:ok, result} =
+        ChatVertexAI.call(chat, [
+          Message.new_user!("Return the response 'Colorful Threads'.")
+        ])
+
+      assert [
+               [
+                 %MessageDelta{
+                   content: "Colorful Threads",
+                   status: :complete,
+                   index: nil,
+                   role: :assistant,
+                   tool_calls: nil,
+                   metadata: %{
+                     usage: %TokenUsage{
+                       input: 7,
+                       output: 2
+                     }
+                   }
+                 }
+               ]
+             ] = result
+
+      assert_received {:fired_token_usage, usage}
+      assert %TokenUsage{input: 7, output: 2} = usage
+    end
+  end
+
+  describe "google_search native tool" do
+    @tag live_call: true, live_google_ai: true
+    test "should include grounding metadata in response" do
+      alias LangChain.Chains.LLMChain
+      alias LangChain.Message
+      alias LangChain.NativeTool
+
+      chat =
+        ChatVertexAI.new!(%{
+          model: "gemini-2.5-flash",
+          temperature: 0,
+          endpoint: System.fetch_env!("VERTEX_API_ENDPOINT"),
+          stream: true
+        })
+
+      {:ok, updated_chain} =
+        %{llm: chat, verbose: false, stream: false}
+        |> LLMChain.new!()
+        |> LLMChain.add_message(Message.new_user!("What is the current Google stock price?"))
+        |> LLMChain.add_tools(NativeTool.new!(%{name: "google_search", configuration: %{}}))
+        |> LLMChain.run()
+
+      assert %Message{} = updated_chain.last_message
+      assert updated_chain.last_message.role == :assistant
+      assert Map.has_key?(updated_chain.last_message.metadata, "groundingChunks")
+    end
+  end
+
+  describe "req_config" do
+    test "merges req_config into the request (non-streaming)" do
+      expect(Req, :post, fn req_struct ->
+        # assert headers from req_config
+        assert req_struct.headers == %{"x-vertex-ai-llm-request-type" => ["shared"]}
+
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model =
+        ChatVertexAI.new!(%{
+          endpoint: "http://localhost:1234/",
+          stream: false,
+          model: @test_model,
+          req_config: %{headers: [{"X-Vertex-AI-LLM-Request-Type", "shared"}]}
+        })
+
+      assert {:error, _} = ChatVertexAI.call(model, "prompt", [])
+      verify!()
+    end
+
+    test "merges req_config into the request (streaming)" do
+      expect(Req, :post, fn req_struct, _opts ->
+        # assert headers from req_config
+        assert req_struct.headers == %{
+                 "x-vertex-ai-llm-request-type" => ["shared"],
+                 "accept-encoding" => ["utf-8"]
+               }
+
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model =
+        ChatVertexAI.new!(%{
+          endpoint: "http://localhost:1234/",
+          stream: true,
+          model: @test_model,
+          req_config: %{headers: [{"X-Vertex-AI-LLM-Request-Type", "shared"}]}
+        })
+
+      assert {:error, _} = ChatVertexAI.call(model, "prompt", [])
+      verify!()
     end
   end
 end

@@ -71,6 +71,15 @@ defmodule LangChain.MessageProcessors.JsonProcessor do
       {:cont, updated_chain, updated_message} =
         JsonProcessor.run(chain, message, ~r/```json(.*?)```/s)
 
+
+  ## JsonProcessor vs Tool Usage
+
+  The `JsonProcessor` is not compatible with tool usage. Some simpler models do
+  not support tool usage and the `JsonProcessor` can help get structured
+  responses out of them more easily.
+
+  The `JsonProcessor` is run on the assistant's response. If the response is a
+  ToolCall, then the response does not contain text JSON contents to process.
   """
   alias LangChain.Chains.LLMChain
   alias LangChain.Message
@@ -110,29 +119,44 @@ defmodule LangChain.MessageProcessors.JsonProcessor do
   @spec run(LLMChain.t(), Message.t()) ::
           {:cont, Message.t()} | {:halt, Message.t()}
   def run(%LLMChain{} = chain, %Message{} = message) do
-    case Jason.decode(content_to_string(message.processed_content)) do
-      {:ok, parsed} ->
-        if chain.verbose, do: IO.puts("Parsed JSON text to a map")
-        {:cont, %Message{message | processed_content: parsed}}
+    metadata = %{
+      processor: "json_processor",
+      message_role: message.role
+    }
 
-      {:error, %Jason.DecodeError{} = error} ->
-        error_message = Jason.DecodeError.message(error)
-        {:halt, Message.new_user!("ERROR: Invalid JSON data: #{error_message}")}
-    end
+    LangChain.Telemetry.span([:langchain, :message, :process], metadata, fn ->
+      case Jason.decode(content_to_string(message.processed_content)) do
+        {:ok, parsed} ->
+          if chain.verbose, do: IO.puts("Parsed JSON text to a map")
+          {:cont, %Message{message | processed_content: parsed}}
+
+        {:error, %Jason.DecodeError{} = error} ->
+          error_message = Jason.DecodeError.message(error)
+          {:halt, Message.new_user!("ERROR: Invalid JSON data: #{error_message}")}
+      end
+    end)
   end
 
   def run(%LLMChain{} = chain, %Message{} = message, regex_pattern) do
-    case Regex.run(regex_pattern, content_to_string(message.processed_content),
-           capture: :all_but_first
-         ) do
-      [json] ->
-        if chain.verbose, do: IO.puts("Extracted JSON text from message")
-        # run recursive call on just the extracted JSON
-        run(chain, %Message{message | processed_content: json})
+    metadata = %{
+      processor: "json_processor",
+      message_role: message.role,
+      with_regex: true
+    }
 
-      _ ->
-        {:halt, Message.new_user!("ERROR: No JSON found")}
-    end
+    LangChain.Telemetry.span([:langchain, :message, :process], metadata, fn ->
+      case Regex.run(regex_pattern, content_to_string(message.processed_content),
+             capture: :all_but_first
+           ) do
+        [json] ->
+          if chain.verbose, do: IO.puts("Extracted JSON text from message")
+          # run recursive call on just the extracted JSON
+          run(chain, %Message{message | processed_content: json})
+
+        _ ->
+          {:halt, Message.new_user!("ERROR: No JSON found")}
+      end
+    end)
   end
 
   defp content_to_string([

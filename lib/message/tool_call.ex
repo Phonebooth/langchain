@@ -28,6 +28,8 @@ defmodule LangChain.Message.ToolCall do
     # when the tool call is incomplete, the index indicates which tool call to
     # update on a ToolCall.
     field :index, :integer
+    # Map of model-specific metadata attributes
+    field :metadata, :map
   end
 
   # https://cookbook.openai.com/examples/how_to_call_functions_with_chat_models
@@ -38,7 +40,7 @@ defmodule LangChain.Message.ToolCall do
 
   @type t :: %ToolCall{}
 
-  @update_fields [:status, :type, :call_id, :name, :arguments, :index]
+  @update_fields [:status, :type, :call_id, :name, :arguments, :index, :metadata]
   @create_fields @update_fields
 
   @doc """
@@ -207,6 +209,14 @@ defmodule LangChain.Message.ToolCall do
   defp update_status(%ToolCall{} = primary, %ToolCall{} = _delta_part) do
     # status flag not updated
     primary
+  end
+
+  defp append_arguments(%ToolCall{status: :incomplete} = primary, %ToolCall{
+         status: :complete,
+         arguments: new_arguments
+       })
+       when is_map(new_arguments) do
+    %ToolCall{primary | arguments: new_arguments}
   end
 
   defp append_arguments(%ToolCall{} = primary, %ToolCall{

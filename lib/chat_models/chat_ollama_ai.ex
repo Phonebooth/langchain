@@ -29,6 +29,11 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
 
   Usage examples and more details are in the LangChain documentation or the
   module's function docs.
+
+  ## Tool Support
+
+  Currently, `ChatOllamaAI` supports tool calls when not streaming the responses.
+  Streaming tool calls is not yet supported.
   """
   use Ecto.Schema
   require Logger
@@ -37,9 +42,15 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
   alias LangChain.ChatModels.ChatModel
   alias LangChain.ChatModels.ChatOpenAI
   alias LangChain.Message
+  alias LangChain.Message.ContentPart
+  alias LangChain.Message.ToolCall
+  alias LangChain.Message.ToolResult
   alias LangChain.MessageDelta
+  alias LangChain.Function
+  alias LangChain.FunctionParam
   alias LangChain.LangChainError
   alias LangChain.Utils
+  alias LangChain.Callbacks
 
   @behaviour ChatModel
 
@@ -68,7 +79,8 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
     :temperature,
     :tfs_z,
     :top_k,
-    :top_p
+    :top_p,
+    :verbose_api
   ]
 
   @required_fields [:endpoint, :model]
@@ -134,7 +146,9 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
 
     # Sets the stop sequences to use. When this pattern is encountered the LLM will stop generating text and return.
     # Multiple stop patterns may be set by specifying multiple separate stop parameters in a modelfile.
-    field :stop, :string
+    # Empty arrays [] are excluded from API requests via Utils.conditionally_add_to_map to preserve modelfile defaults.
+    # This prevents overriding the model's built-in stop tokens (e.g., <|eot_id|>, Human:, Assistant:).
+    field :stop, {:array, :string}, default: []
 
     field :stream, :boolean, default: false
 
@@ -156,6 +170,10 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
 
     # A list of maps for callback handlers (treat as private)
     field :callbacks, {:array, :map}, default: []
+
+    # For help with debugging. It outputs the RAW Req response received and the
+    # RAW Elixir map being submitted to the API.
+    field :verbose_api, :boolean, default: false
   end
 
   @doc """
@@ -190,41 +208,154 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
     |> validate_number(:mirostat_eta, greater_than_or_equal_to: 0.0, less_than_or_equal_to: 1.0)
   end
 
+  defp messages_for_api(messages) do
+    Enum.reduce(messages, [], fn m, acc ->
+      case for_api(m) do
+        data when is_map(data) -> [data | acc]
+        data when is_list(data) -> Enum.reverse(data) ++ acc
+      end
+    end)
+    |> Enum.reverse()
+  end
+
   @doc """
   Return the params formatted for an API request.
   """
-  def for_api(%ChatOllamaAI{} = model, messages, _functions) do
+  def for_api(%ChatOllamaAI{} = model, messages, tools) do
     %{
       model: model.model,
-      temperature: model.temperature,
-      messages: messages |> Enum.map(&ChatOpenAI.for_api(model, &1)),
+      messages: messages_for_api(messages),
       stream: model.stream,
-      seed: model.seed,
-      num_ctx: model.num_ctx,
-      num_predict: model.num_predict,
-      repeat_last_n: model.repeat_last_n,
-      repeat_penalty: model.repeat_penalty,
-      keep_alive: model.keep_alive,
-      mirostat: model.mirostat,
-      mirostat_eta: model.mirostat_eta,
-      mirostat_tau: model.mirostat_tau,
-      num_gqa: model.num_gqa,
-      num_gpu: model.num_gpu,
-      num_thread: model.num_thread,
-      receive_timeout: model.receive_timeout,
-      stop: model.stop,
-      tfs_z: model.tfs_z,
-      top_k: model.top_k,
-      top_p: model.top_p
+      options:
+        %{
+          temperature: model.temperature,
+          seed: model.seed,
+          num_ctx: model.num_ctx,
+          num_predict: model.num_predict,
+          repeat_last_n: model.repeat_last_n,
+          repeat_penalty: model.repeat_penalty,
+          mirostat: model.mirostat,
+          mirostat_eta: model.mirostat_eta,
+          mirostat_tau: model.mirostat_tau,
+          num_gqa: model.num_gqa,
+          num_gpu: model.num_gpu,
+          num_thread: model.num_thread,
+          tfs_z: model.tfs_z,
+          top_k: model.top_k,
+          top_p: model.top_p
+        }
+        # Conditionally add stop sequences: excludes empty arrays [] and nil to preserve modelfile defaults
+        |> Utils.conditionally_add_to_map(:stop, model.stop),
+      receive_timeout: model.receive_timeout
     }
+    |> Utils.conditionally_add_to_map(:tools, get_tools_for_api(tools))
+  end
+
+  def for_api(%Message{role: :assistant, tool_calls: tool_calls} = msg)
+      when is_list(tool_calls) do
+    content =
+      case msg.content do
+        content when is_binary(content) -> content
+        content when is_list(content) -> ContentPart.parts_to_string(content)
+        nil -> nil
+      end
+
+    %{
+      "role" => :assistant,
+      "content" => content
+    }
+    |> Utils.conditionally_add_to_map("tool_calls", Enum.map(tool_calls, &for_api(&1)))
+  end
+
+  # ToolCall support
+  def for_api(%ToolCall{type: :function} = fun) do
+    %{
+      "id" => fun.call_id,
+      "type" => "function",
+      "function" => %{
+        "name" => fun.name,
+        "arguments" => fun.arguments
+      }
+    }
+  end
+
+  # Function support
+  def for_api(%Function{} = fun) do
+    %{
+      "name" => fun.name,
+      "parameters" => get_parameters(fun)
+    }
+    |> Utils.conditionally_add_to_map("description", fun.description)
+  end
+
+  def for_api(%Message{role: :tool, tool_results: tool_results}) when is_list(tool_results) do
+    Enum.map(tool_results, &for_api/1)
+  end
+
+  def for_api(%ToolResult{content: content}) do
+    %{
+      "role" => :tool,
+      "content" => ContentPart.parts_to_string(content)
+    }
+  end
+
+  def for_api(%Message{content: content} = msg) when is_binary(content) do
+    %{
+      "role" => msg.role,
+      "content" => ContentPart.content_to_string(msg.content)
+    }
+    |> Utils.conditionally_add_to_map("name", msg.name)
+  end
+
+  def for_api(%Message{role: :user, content: content} = msg) when is_list(content) do
+    %{
+      "role" => msg.role,
+      "content" => ContentPart.content_to_string(content)
+    }
+    |> Utils.conditionally_add_to_map("name", msg.name)
+  end
+
+  # Handle messages with ContentPart content for non-user roles
+  def for_api(%Message{content: content} = msg) when is_list(content) do
+    %{
+      "role" => msg.role,
+      "content" => ContentPart.parts_to_string(content)
+    }
+    |> Utils.conditionally_add_to_map("name", msg.name)
+  end
+
+  # Handle ContentPart structures
+  def for_api(%ContentPart{type: :text, content: content}) do
+    content
+  end
+
+  defp get_tools_for_api(nil), do: []
+
+  defp get_tools_for_api(tools) do
+    Enum.map(tools, fn %Function{} = function ->
+      %{"type" => "function", "function" => for_api(function)}
+    end)
+  end
+
+  defp get_parameters(%Function{parameters: [], parameters_schema: nil} = _fun) do
+    %{
+      "type" => "object",
+      "properties" => %{}
+    }
+  end
+
+  defp get_parameters(%Function{parameters: [], parameters_schema: schema} = _fun)
+       when is_map(schema) do
+    schema
+  end
+
+  defp get_parameters(%Function{parameters: params} = _fun) do
+    FunctionParam.to_parameters_schema(params)
   end
 
   @doc """
   Calls the Ollama Chat Completion API struct with configuration, plus
   either a simple message or the list of messages to act as the prompt.
-
-  **NOTE:** This API as of right now does not support functions. More
-  information here: https://github.com/jmorganca/ollama/issues/1729
 
   **NOTE:** This function *can* be used directly, but the primary interface
   should be through `LangChain.Chains.LLMChain`. The `ChatOllamaAI` module is more focused on
@@ -238,31 +369,50 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
   """
 
   @impl ChatModel
-  def call(ollama_ai, prompt, functions \\ [])
+  def call(ollama_ai, prompt, tools \\ [])
 
-  def call(%ChatOllamaAI{} = ollama_ai, prompt, functions) when is_binary(prompt) do
+  def call(%ChatOllamaAI{} = ollama_ai, prompt, tools) when is_binary(prompt) do
     messages = [
       Message.new_system!(),
       Message.new_user!(prompt)
     ]
 
-    call(ollama_ai, messages, functions)
+    call(ollama_ai, messages, tools)
   end
 
-  def call(%ChatOllamaAI{} = ollama_ai, messages, functions)
-      when is_list(messages) do
-    try do
-      case do_api_request(ollama_ai, messages, functions) do
-        {:error, reason} ->
-          {:error, reason}
+  def call(%ChatOllamaAI{} = ollama_ai, messages, tools) when is_list(messages) do
+    metadata = %{
+      model: ollama_ai.model,
+      message_count: length(messages),
+      tools_count: length(tools)
+    }
 
-        parsed_data ->
-          {:ok, parsed_data}
+    LangChain.Telemetry.span([:langchain, :llm, :call], metadata, fn ->
+      try do
+        # Track the prompt being sent
+        LangChain.Telemetry.llm_prompt(
+          %{system_time: System.system_time()},
+          %{model: ollama_ai.model, messages: messages}
+        )
+
+        case __MODULE__.do_api_request(ollama_ai, messages, tools) do
+          {:error, reason} ->
+            {:error, reason}
+
+          parsed_data ->
+            # Track the response being received
+            LangChain.Telemetry.llm_response(
+              %{system_time: System.system_time()},
+              %{model: ollama_ai.model, response: parsed_data}
+            )
+
+            {:ok, parsed_data}
+        end
+      rescue
+        err in LangChainError ->
+          {:error, err.message}
       end
-    rescue
-      err in LangChainError ->
-        {:error, err.message}
-    end
+    end)
   end
 
   # Make the API request from the Ollama server.
@@ -280,27 +430,30 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
   #
   # Retries the request up to 3 times on transient errors with a 1 second delay
   @doc false
-  @spec do_api_request(t(), [Message.t()], [Function.t()]) ::
-          list() | struct() | {:error, LangChainError.t()}
-  def do_api_request(ollama_ai, messages, functions, retry_count \\ 3)
+  @spec do_api_request(t(), [Message.t()], ChatModel.tools(), integer()) ::
+          list() | struct() | {:error, String.t()}
+  def do_api_request(ollama_ai, messages, tools, retry_count \\ 3)
 
-  def do_api_request(_ollama_ai, _messages, _functions, 0) do
-    raise LangChainError.exception(
-            type: "retries_exceeded",
-            message: "Retries exceeded. Connection failed."
-          )
+  def do_api_request(_ollama_ai, _messages, _tools, 0) do
+    raise LangChainError, "Retries exceeded. Connection failed."
   end
 
   def do_api_request(
         %ChatOllamaAI{stream: false} = ollama_ai,
         messages,
-        functions,
+        tools,
         retry_count
       ) do
+    raw_data = for_api(ollama_ai, messages, tools)
+
+    if ollama_ai.verbose_api do
+      IO.inspect(raw_data, label: "RAW DATA BEING SUBMITTED")
+    end
+
     req =
       Req.new(
         url: ollama_ai.endpoint,
-        json: for_api(ollama_ai, messages, functions),
+        json: raw_data,
         receive_timeout: ollama_ai.receive_timeout,
         retry: :transient,
         max_retries: 3,
@@ -311,12 +464,28 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
     req
     |> Req.post()
     |> case do
-      {:ok, %Req.Response{body: data}} ->
+      {:ok, %Req.Response{body: data} = response} ->
+        if ollama_ai.verbose_api do
+          IO.inspect(response, label: "RAW REQ RESPONSE")
+        end
+
+        Callbacks.fire(ollama_ai.callbacks, :on_llm_response_headers, [response.headers])
+
         case do_process_response(ollama_ai, data) do
           {:error, reason} ->
             {:error, reason}
 
           result ->
+            # Track non-streaming response completion
+            LangChain.Telemetry.emit_event(
+              [:langchain, :llm, :response, :non_streaming],
+              %{system_time: System.system_time()},
+              %{
+                model: ollama_ai.model,
+                response_size: byte_size(inspect(result))
+              }
+            )
+
             result
         end
 
@@ -326,7 +495,7 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
       {:error, %Req.TransportError{reason: :closed}} ->
         # Force a retry by making a recursive call decrementing the counter
         Logger.debug(fn -> "Mint connection closed: retry count = #{inspect(retry_count)}" end)
-        do_api_request(ollama_ai, messages, functions, retry_count - 1)
+        do_api_request(ollama_ai, messages, tools, retry_count - 1)
 
       other ->
         Logger.error("Unexpected and unhandled API response! #{inspect(other)}")
@@ -337,12 +506,18 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
   def do_api_request(
         %ChatOllamaAI{stream: true} = ollama_ai,
         messages,
-        functions,
+        tools,
         retry_count
       ) do
+    raw_data = for_api(ollama_ai, messages, tools)
+
+    if ollama_ai.verbose_api do
+      IO.inspect(raw_data, label: "RAW DATA BEING SUBMITTED")
+    end
+
     Req.new(
       url: ollama_ai.endpoint,
-      json: for_api(ollama_ai, messages, functions),
+      json: raw_data,
       inet6: true,
       receive_timeout: ollama_ai.receive_timeout
     )
@@ -355,7 +530,9 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
         )
     )
     |> case do
-      {:ok, %Req.Response{body: data}} ->
+      {:ok, %Req.Response{body: data} = response} ->
+        Callbacks.fire(ollama_ai.callbacks, :on_llm_response_headers, [response.headers])
+
         data
 
       {:error, %LangChainError{} = error} ->
@@ -368,7 +545,7 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
       {:error, %Req.TransportError{reason: :closed}} ->
         # Force a retry by making a recursive call decrementing the counter
         Logger.debug(fn -> "Mint connection closed: retry count = #{inspect(retry_count)}" end)
-        do_api_request(ollama_ai, messages, functions, retry_count - 1)
+        do_api_request(ollama_ai, messages, tools, retry_count - 1)
 
       other ->
         Logger.error(
@@ -384,6 +561,18 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
     create_message(message, :complete, MessageDelta)
   end
 
+  def do_process_response(model, %{
+        "message" => %{"tool_calls" => calls} = message,
+        "done" => true
+      })
+      when calls != [] do
+    message
+    |> Map.merge(%{
+      "tool_calls" => Enum.map(calls, &do_process_response(model, &1))
+    })
+    |> create_message(:complete, Message)
+  end
+
   def do_process_response(_model, %{"message" => message, "done" => true}) do
     create_message(message, :complete, Message)
   end
@@ -392,9 +581,31 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
     create_message(message, :incomplete, MessageDelta)
   end
 
-  def do_process_response(_model, %{"error" => reason}) do
+  def do_process_response(_model, %{"error" => reason} = response) do
     Logger.error("Received error from API: #{inspect(reason)}")
-    {:error, LangChainError.exception(message: reason)}
+    {:error, LangChainError.exception(message: reason, original: response)}
+  end
+
+  def do_process_response(_model, %{
+        "function" => %{
+          "arguments" => args,
+          "name" => name
+        }
+      }) do
+    case ToolCall.new(%{
+           call_id: Ecto.UUID.generate(),
+           type: :function,
+           name: name,
+           arguments: args
+         }) do
+      {:ok, %ToolCall{} = call} ->
+        call
+
+      {:error, changeset} ->
+        reason = Utils.changeset_error_to_string(changeset)
+        Logger.error("Failed to process ToolCall for a function. Reason: #{reason}")
+        {:error, reason}
+    end
   end
 
   defp create_message(message, status, message_type) do
@@ -406,6 +617,20 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
         {:error, LangChainError.exception(changeset)}
     end
   end
+
+  @doc """
+  Determine if an error should be retried. If `true`, a fallback LLM may be
+  used. If `false`, the error is understood to be more fundamental with the
+  request rather than a service issue and it should not be retried or fallback
+  to another service.
+  """
+  @impl ChatModel
+  @spec retry_on_fallback?(LangChainError.t()) :: boolean()
+  def retry_on_fallback?(%LangChainError{type: "rate_limited"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "rate_limit_exceeded"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "timeout"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "too_many_requests"}), do: true
+  def retry_on_fallback?(_), do: false
 
   @doc """
   Generate a config map that can later restore the model's configuration.
@@ -436,7 +661,8 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
         :temperature,
         :tfs_z,
         :top_k,
-        :top_p
+        :top_p,
+        :verbose_api
       ],
       @current_config_version
     )

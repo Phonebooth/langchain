@@ -1,6 +1,9 @@
 defmodule LangChain.Callbacks do
   @moduledoc """
   Defines the structure of callbacks and provides utilities for executing them.
+
+  See `LangChain.Chains.ChainCallbacks` for the list of callbacks that can be
+  used.
   """
   require Logger
   alias LangChain.LangChainError
@@ -16,12 +19,6 @@ defmodule LangChain.Callbacks do
   def fire(callbacks, :on_llm_new_message, [messages]) when is_list(messages) do
     Enum.each(messages, fn m ->
       fire(callbacks, :on_llm_new_message, [m])
-    end)
-  end
-
-  def fire(callbacks, :on_llm_new_delta, [deltas]) when is_list(deltas) do
-    Enum.each(deltas, fn d ->
-      fire(callbacks, :on_llm_new_delta, [d])
     end)
   end
 

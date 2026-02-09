@@ -112,6 +112,11 @@ defmodule LangChain.ChatModels.ChatBumblebee do
   alias LangChain.Utils.Parser.LLAMA_3_1_CustomToolParser
   alias LangChain.Utils.Parser.LLAMA_3_2_CustomToolParser
 
+  # Suppress warnings for optional dependencies
+  @compile {:no_warn_undefined, [Nx.Serving]}
+  @compile {:no_warn_undefined, [LangChain.Utils.Parser.LLAMA_3_1_CustomToolParser]}
+  @compile {:no_warn_undefined, [LangChain.Utils.Parser.LLAMA_3_2_CustomToolParser]}
+
   @behaviour ChatModel
 
   @current_config_version 1
@@ -231,19 +236,40 @@ defmodule LangChain.ChatModels.ChatBumblebee do
   end
 
   def call(%ChatBumblebee{} = model, messages, functions) when is_list(messages) do
-    try do
-      # make base api request and perform high-level success/failure checks
-      case do_serving_request(model, messages, functions) do
-        {:error, reason} ->
-          {:error, reason}
+    metadata = %{
+      model: inspect(model.serving),
+      template_format: model.template_format,
+      message_count: length(messages),
+      tools_count: length(functions)
+    }
 
-        parsed_data ->
-          {:ok, parsed_data}
+    LangChain.Telemetry.span([:langchain, :llm, :call], metadata, fn ->
+      try do
+        # Track the prompt being sent
+        LangChain.Telemetry.llm_prompt(
+          %{system_time: System.system_time()},
+          %{model: inspect(model.serving), messages: messages}
+        )
+
+        # make base api request and perform high-level success/failure checks
+        case do_serving_request(model, messages, functions) do
+          {:error, reason} ->
+            {:error, reason}
+
+          parsed_data ->
+            # Track the response being received
+            LangChain.Telemetry.llm_response(
+              %{system_time: System.system_time()},
+              %{model: inspect(model.serving), response: parsed_data}
+            )
+
+            {:ok, parsed_data}
+        end
+      rescue
+        err in LangChainError ->
+          {:error, err}
       end
-    rescue
-      err in LangChainError ->
-        {:error, err}
-    end
+    end)
   end
 
   @doc false
@@ -461,6 +487,16 @@ defmodule LangChain.ChatModels.ChatBumblebee do
       when is_binary(content) do
     fire_token_usage_callback(model, token_summary)
 
+    # Track non-streaming response completion
+    LangChain.Telemetry.emit_event(
+      [:langchain, :llm, :response, :non_streaming],
+      %{system_time: System.system_time()},
+      %{
+        model: inspect(model.serving),
+        response_size: byte_size(inspect(content))
+      }
+    )
+
     case Message.new(%{role: :assistant, status: :complete, content: content}) do
       {:ok, message} ->
         # execute the callback with the final message
@@ -494,6 +530,13 @@ defmodule LangChain.ChatModels.ChatBumblebee do
     chunk_processor = fn
       {:done, %{token_summary: token_summary}} ->
         fire_token_usage_callback(model, token_summary)
+
+        # Track stream completion
+        LangChain.Telemetry.emit_event(
+          [:langchain, :llm, :response, streaming: true],
+          %{system_time: System.system_time()},
+          %{model: inspect(model.serving)}
+        )
 
         final_delta = MessageDelta.new!(%{role: :assistant, status: :complete})
         Callbacks.fire(model.callbacks, :on_llm_new_delta, [final_delta])
@@ -532,6 +575,16 @@ defmodule LangChain.ChatModels.ChatBumblebee do
   end
 
   defp fire_token_usage_callback(_model, _token_summary), do: :ok
+
+  @doc """
+  Determine if an error should be retried. If `true`, a fallback LLM may be
+  used. If `false`, the error is understood to be more fundamental with the
+  request rather than a service issue and it should not be retried or fallback
+  to another service.
+  """
+  @impl ChatModel
+  @spec retry_on_fallback?(LangChainError.t()) :: boolean()
+  def retry_on_fallback?(_), do: true
 
   @doc """
   Generate a config map that can later restore the model's configuration.

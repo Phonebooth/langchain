@@ -4,6 +4,7 @@ defmodule LangChain.FunctionTest do
   doctest LangChain.Function
 
   alias LangChain.Function
+  alias LangChain.Message.ContentPart
 
   defp hello_world(_args, _context) do
     "Hello world!"
@@ -23,7 +24,7 @@ defmodule LangChain.FunctionTest do
                Function.new(%{"name" => "hello_world", "function" => &hello_world/2})
 
       assert fun.name == "hello_world"
-      assert fun.async == true
+      assert fun.async == false
     end
 
     test "allows for tracking async setting" do
@@ -139,11 +140,207 @@ defmodule LangChain.FunctionTest do
 
       assert result ==
                {:error,
-                "ERROR: (RuntimeError) fake exception at test/function_test.exs:13: LangChain.FunctionTest.returns_context/2"}
+                "ERROR: (RuntimeError) fake exception at test/function_test.exs:14: LangChain.FunctionTest.returns_context/2"}
 
       # returns an error when anything else is returned
       result = Function.execute(function, %{}, %{result: 123})
       assert result == {:error, "An unexpected response was returned from the tool."}
+    end
+
+    test "handles multi-part responses from tools" do
+      # Simulate a tool that returns an image with text metadata
+      image_tool = fn _args, _context ->
+        [
+          ContentPart.text!("Generated visualization of sales data"),
+          ContentPart.image!("base64encodedimagedata==", media: :jpg)
+        ]
+      end
+
+      function = Function.new!(%{name: "generate_chart", function: image_tool})
+      result = Function.execute(function, %{}, %{})
+
+      assert {:ok, parts} = result
+      assert is_list(parts)
+      assert length(parts) == 2
+
+      assert %ContentPart{type: :text, content: "Generated visualization of sales data"} =
+               Enum.at(parts, 0)
+
+      assert %ContentPart{type: :image, content: "base64encodedimagedata=="} = Enum.at(parts, 1)
+    end
+
+    test "validates required parameters before execution" do
+      alias LangChain.FunctionParam
+
+      function =
+        Function.new!(%{
+          name: "create_record",
+          parameters: [
+            FunctionParam.new!(%{name: "record_id", type: :string, required: true}),
+            FunctionParam.new!(%{name: "content", type: :string, required: true}),
+            FunctionParam.new!(%{name: "active", type: :boolean, required: false})
+          ],
+          function: &returns_context/2
+        })
+
+      # Test with missing required parameters
+      result =
+        Function.execute(
+          function,
+          %{"active" => true, "display_name" => "Some Name"},
+          %{result: {:ok, "SUCCESS"}}
+        )
+
+      assert {:error, message} = result
+      assert message =~ "Missing required parameters"
+      assert message =~ "Required parameters:"
+      assert message =~ "record_id"
+      assert message =~ "content"
+    end
+
+    test "allows execution when all required parameters are present" do
+      alias LangChain.FunctionParam
+
+      function =
+        Function.new!(%{
+          name: "create_record",
+          parameters: [
+            FunctionParam.new!(%{name: "record_id", type: :string, required: true}),
+            FunctionParam.new!(%{name: "content", type: :string, required: true}),
+            FunctionParam.new!(%{name: "active", type: :boolean, required: false})
+          ],
+          function: &returns_context/2
+        })
+
+      # Test with all required parameters present
+      result =
+        Function.execute(
+          function,
+          %{"record_id" => "123", "content" => "Test content", "active" => true},
+          %{result: {:ok, "SUCCESS"}}
+        )
+
+      assert result == {:ok, "SUCCESS"}
+    end
+
+    test "allows execution when no required parameters are defined" do
+      alias LangChain.FunctionParam
+
+      function =
+        Function.new!(%{
+          name: "optional_params",
+          parameters: [
+            FunctionParam.new!(%{name: "option1", type: :string, required: false}),
+            FunctionParam.new!(%{name: "option2", type: :boolean, required: false})
+          ],
+          function: &returns_context/2
+        })
+
+      # All parameters are optional, should execute even with no args
+      result = Function.execute(function, %{}, %{result: {:ok, "SUCCESS"}})
+      assert result == {:ok, "SUCCESS"}
+    end
+
+    test "skips validation when using parameters_schema instead of parameters" do
+      function =
+        Function.new!(%{
+          name: "with_schema",
+          parameters_schema: %{
+            type: "object",
+            properties: %{field: %{type: "string"}},
+            required: ["field"]
+          },
+          function: &returns_context/2
+        })
+
+      # parameters_schema validation is not implemented yet, so it should execute
+      result = Function.execute(function, %{}, %{result: {:ok, "SUCCESS"}})
+      assert result == {:ok, "SUCCESS"}
+    end
+
+    test "allows execution when required params are present with extra params" do
+      alias LangChain.FunctionParam
+
+      function =
+        Function.new!(%{
+          name: "create_record",
+          parameters: [
+            FunctionParam.new!(%{name: "record_id", type: :string, required: true}),
+            FunctionParam.new!(%{name: "content", type: :string, required: true})
+          ],
+          function: &returns_context/2
+        })
+
+      # Test with required parameters plus extra unexpected ones
+      result =
+        Function.execute(
+          function,
+          %{
+            "record_id" => "123",
+            "content" => "Test content",
+            "active" => true,
+            "display_name" => "Some Name",
+            "extra_field" => "unexpected"
+          },
+          %{result: {:ok, "SUCCESS"}}
+        )
+
+      assert result == {:ok, "SUCCESS"}
+    end
+
+    test "allows execution with mix of required, optional, and extra params" do
+      alias LangChain.FunctionParam
+
+      function =
+        Function.new!(%{
+          name: "update_record",
+          parameters: [
+            FunctionParam.new!(%{name: "record_id", type: :string, required: true}),
+            FunctionParam.new!(%{name: "title", type: :string, required: false}),
+            FunctionParam.new!(%{name: "enabled", type: :boolean, required: false})
+          ],
+          function: &returns_context/2
+        })
+
+      # Required + optional + extra params should work
+      result =
+        Function.execute(
+          function,
+          %{
+            "record_id" => "456",
+            "title" => "New Title",
+            "extra_metadata" => %{"foo" => "bar"},
+            "unknown_field" => 123
+          },
+          %{result: {:ok, "SUCCESS"}}
+        )
+
+      assert result == {:ok, "SUCCESS"}
+    end
+
+    test "validates only required params, ignores missing optional params" do
+      alias LangChain.FunctionParam
+
+      function =
+        Function.new!(%{
+          name: "partial_update",
+          parameters: [
+            FunctionParam.new!(%{name: "id", type: :string, required: true}),
+            FunctionParam.new!(%{name: "optional1", type: :string, required: false}),
+            FunctionParam.new!(%{name: "optional2", type: :boolean, required: false})
+          ],
+          function: &returns_context/2
+        })
+
+      # Only required param provided, optional ones missing - should work
+      result =
+        Function.execute(
+          function,
+          %{"id" => "789"},
+          %{result: {:ok, "SUCCESS"}}
+        )
+
+      assert result == {:ok, "SUCCESS"}
     end
   end
 end

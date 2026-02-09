@@ -3,6 +3,39 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   Parses and validates inputs for making a request for the Google AI  Chat API.
 
   Converts response into more specialized `LangChain` data structures.
+
+  Example Usage:
+
+  ```elixir
+  alias LangChain.Chains.LLMChain
+  alias LangChain.Message
+  alias LangChain.Message.ContentPart
+  alias LangChain.ChatModels.ChatVertexAI
+
+  config = %{
+        model: "gemini-2.0-flash",
+        api_key: ..., # vertex requires gcloud auth token https://cloud.google.com/vertex-ai/generative-ai/docs/start/quickstarts/quickstart-multimodal#rest
+        temperature: 1.0,
+        top_p: 0.8,
+        receive_timeout: ...
+      }
+   model = ChatVertexAI.new!(config)
+
+      %{llm: model, verbose: false, stream: false}
+      |> LLMChain.new!()
+      |> LLMChain.add_message(
+        Message.new_user!([
+          ContentPart.new!(%{type: :text, content: "Analyse the provided file and share a summary"}),
+          ContentPart.new!(%{
+            type: :file_url,
+            content: ...,
+            options: [media: ...]
+          })
+        ])
+      )
+      |> LLMChain.run()
+  The above call will return summary of the media content.
+  ```
   """
   use Ecto.Schema
   require Logger
@@ -19,6 +52,9 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   alias LangChain.LangChainError
   alias LangChain.Utils
   alias LangChain.Callbacks
+  alias LangChain.TokenUsage
+  alias LangChain.NativeTool
+  alias LangChain.Function
 
   @behaviour ChatModel
 
@@ -32,7 +68,7 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     field :endpoint, :string
 
     field :model, :string, default: "gemini-pro"
-    field :api_key, :string
+    field :api_key, :string, redact: true
 
     # What sampling temperature to use, between 0 and 2. Higher values like 0.8
     # will make the output more random, while lower values like 0.2 will make it
@@ -56,16 +92,30 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     # selected using temperature sampling.
     field :top_k, :float, default: 1.0
 
+    # Configure thinking budget and whether to include thought summaries (content type `:thinking`).
+    # See https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thinking
+    #
+    # Config reference: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations.evaluationRuns#ThinkingConfig
+    field :thinking_config, :map, default: nil
+
     # Duration in seconds for the response to be received. When streaming a very
     # lengthy response, a longer time limit may be required. However, when it
     # goes on too long by itself, it tends to hallucinate more.
     field :receive_timeout, :integer, default: @receive_timeout
-
-    field :stream, :boolean, default: false
     field :json_response, :boolean, default: false
+    field :json_schema, :map, default: nil
+    field :stream, :boolean, default: false
 
     # A list of maps for callback handlers (treated as internal)
     field :callbacks, {:array, :map}, default: []
+
+    # Additional level of raw api request and response data
+    field :verbose_api, :boolean, default: false
+
+    # Req options to merge into the request.
+    # Refer to `https://hexdocs.pm/req/Req.html#new/1-options` for
+    # `Req.new` supported set of options.
+    field :req_config, :map, default: %{}
   end
 
   @type t :: %ChatVertexAI{}
@@ -77,9 +127,12 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     :temperature,
     :top_p,
     :top_k,
+    :thinking_config,
     :receive_timeout,
+    :json_response,
+    :json_schema,
     :stream,
-    :json_response
+    :req_config
   ]
   @required_fields [
     :endpoint,
@@ -131,23 +184,31 @@ defmodule LangChain.ChatModels.ChatVertexAI do
       |> List.flatten()
       |> List.wrap()
 
-    req = %{
-      "contents" => messages_for_api,
-      "generationConfig" => %{
+    {response_mime_type, response_schema} =
+      case vertex_ai.json_response do
+        true ->
+          {"application/json", vertex_ai.json_schema}
+
+        false ->
+          {nil, nil}
+      end
+
+    generation_config_params =
+      %{
         "temperature" => vertex_ai.temperature,
         "topP" => vertex_ai.top_p,
         "topK" => vertex_ai.top_k
       }
-    }
-    |> Utils.conditionally_add_to_map("system_instruction", for_api(sys_instructions))
+      |> Utils.conditionally_add_to_map("thinkingConfig", vertex_ai.thinking_config)
+      |> Utils.conditionally_add_to_map("response_mime_type", response_mime_type)
+      |> Utils.conditionally_add_to_map("response_schema", response_schema)
 
     req =
-      if vertex_ai.json_response do
-        req
-        |> put_in(["generationConfig", "response_mime_type"], "application/json")
-      else
-        req
-      end
+      %{
+        "contents" => messages_for_api,
+        "generationConfig" => generation_config_params
+      }
+      |> Utils.conditionally_add_to_map("system_instruction", for_api(sys_instructions))
 
     if functions && not Enum.empty?(functions) do
       req
@@ -155,7 +216,11 @@ defmodule LangChain.ChatModels.ChatVertexAI do
         %{
           # Google AI functions use an OpenAI compatible format.
           # See: https://ai.google.dev/docs/function_calling#how_it_works
-          "functionDeclarations" => Enum.map(functions, &ChatOpenAI.for_api(vertex_ai, &1))
+          # Note: We strip the "strict" field as it's OpenAI-specific and not supported by Vertex AI
+          "functionDeclarations" =>
+            functions
+            |> Enum.map(&ChatOpenAI.for_api(vertex_ai, &1))
+            |> Enum.map(&Map.delete(&1, "strict"))
         }
       ])
     else
@@ -181,25 +246,38 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   end
 
   defp for_api(%Message{role: :system} = message) do
-    %{"parts" => %{"text" => message.content}}
+    # System messages should return a single text part, not a list
+    case get_message_contents(message) do
+      [%{"text" => text}] -> %{"parts" => %{"text" => text}}
+      _ -> %{"parts" => %{"text" => message.content}}
+    end
   end
 
   defp for_api(%Message{role: :user, content: content}) when is_list(content) do
     %{
-      "role" => "user",
+      "role" => map_role(:user),
       "parts" => Enum.map(content, &for_api(&1))
     }
   end
 
   defp for_api(%Message{} = message) do
+    content_parts = get_message_contents(message) || []
+
     %{
       "role" => map_role(message.role),
-      "parts" => [%{"text" => message.content}]
+      "parts" => content_parts
     }
   end
 
   defp for_api(%ContentPart{type: :text} = part) do
     %{"text" => part.content}
+  end
+
+  defp for_api(%ContentPart{type: :thinking}) do
+    # The thinking parts are only thought summaries and are not meant to be
+    # included in future generation requests.
+    # See https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thinking#thought-summaries
+    []
   end
 
   defp for_api(%ContentPart{type: :image} = part) do
@@ -215,8 +293,28 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     %{
       "fileData" => %{
         "mimeType" => Keyword.fetch!(part.options, :media),
-        "data" => part.content
+        "fileUri" => part.content
       }
+    }
+  end
+
+  defp for_api(%ContentPart{type: :file_url} = part) do
+    %{
+      "fileData" => %{
+        "mimeType" => Keyword.fetch!(part.options, :media),
+        "fileUri" => part.content
+      }
+    }
+  end
+
+  defp for_api(%ToolCall{metadata: %{thought_signature: signature}} = call)
+       when is_binary(signature) do
+    %{
+      "functionCall" => %{
+        "args" => call.arguments,
+        "name" => call.name
+      },
+      "thoughtSignature" => signature
     }
   end
 
@@ -230,12 +328,34 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   end
 
   defp for_api(%ToolResult{} = result) do
+    content =
+      result.content
+      |> ContentPart.parts_to_string()
+      |> Jason.decode()
+      |> case do
+        {:ok, data} ->
+          # content was converted through JSON
+          data
+
+        {:error, %Jason.DecodeError{}} ->
+          # assume the result is intended to be a string and return it as-is
+          %{"result" => result.content}
+      end
+
     %{
       "functionResponse" => %{
         "name" => result.name,
-        "response" => Jason.decode!(result.content)
+        "response" => content
       }
     }
+  end
+
+  defp for_api(%NativeTool{name: name, configuration: %{} = config}) do
+    %{name => config}
+  end
+
+  defp for_api(%NativeTool{name: name, configuration: nil}) do
+    name
   end
 
   defp for_api(nil), do: nil
@@ -272,18 +392,38 @@ defmodule LangChain.ChatModels.ChatVertexAI do
 
   def call(%ChatVertexAI{} = vertex_ai, messages, tools)
       when is_list(messages) do
-    try do
-      case do_api_request(vertex_ai, messages, tools) do
-        {:error, reason} ->
-          {:error, reason}
+    metadata = %{
+      model: vertex_ai.model,
+      message_count: length(messages),
+      tools_count: length(tools)
+    }
 
-        parsed_data ->
-          {:ok, parsed_data}
+    LangChain.Telemetry.span([:langchain, :llm, :call], metadata, fn ->
+      try do
+        # Track the prompt being sent
+        LangChain.Telemetry.llm_prompt(
+          %{system_time: System.system_time()},
+          %{model: vertex_ai.model, messages: messages}
+        )
+
+        case do_api_request(vertex_ai, messages, tools) do
+          {:error, reason} ->
+            {:error, reason}
+
+          parsed_data ->
+            # Track the response being received
+            LangChain.Telemetry.llm_response(
+              %{system_time: System.system_time()},
+              %{model: vertex_ai.model, response: parsed_data}
+            )
+
+            {:ok, parsed_data}
+        end
+      rescue
+        err in LangChainError ->
+          {:error, err}
       end
-    rescue
-      err in LangChainError ->
-        {:error, err}
-    end
+    end)
   end
 
   @doc false
@@ -300,17 +440,31 @@ defmodule LangChain.ChatModels.ChatVertexAI do
         auth: {:bearer, get_api_key(vertex_ai)},
         retry_delay: fn attempt -> 300 * attempt end
       )
+      |> Req.merge(vertex_ai.req_config |> Keyword.new())
 
     req
     |> Req.post()
     |> case do
-      {:ok, %Req.Response{body: data}} ->
-        case do_process_response(data) do
+      {:ok, %Req.Response{body: data} = response} ->
+        Callbacks.fire(vertex_ai.callbacks, :on_llm_response_headers, [response.headers])
+
+        case do_process_response(vertex_ai, data) do
           {:error, reason} ->
             {:error, reason}
 
           result ->
             Callbacks.fire(vertex_ai.callbacks, :on_llm_new_message, [result])
+
+            # Track non-streaming response completion
+            LangChain.Telemetry.emit_event(
+              [:langchain, :llm, :response, :non_streaming],
+              %{system_time: System.system_time()},
+              %{
+                model: vertex_ai.model,
+                response_size: byte_size(inspect(result))
+              }
+            )
+
             result
         end
 
@@ -332,16 +486,19 @@ defmodule LangChain.ChatModels.ChatVertexAI do
       receive_timeout: vertex_ai.receive_timeout
     )
     |> Req.Request.put_header("accept-encoding", "utf-8")
+    |> Req.merge(vertex_ai.req_config |> Keyword.new())
     |> Req.post(
       into:
         Utils.handle_stream_fn(
           vertex_ai,
           &ChatOpenAI.decode_stream/1,
-          &do_process_response(&1, MessageDelta)
+          &do_process_response(vertex_ai, &1, MessageDelta)
         )
     )
     |> case do
-      {:ok, %Req.Response{body: data}} ->
+      {:ok, %Req.Response{body: data} = response} ->
+        Callbacks.fire(vertex_ai.callbacks, :on_llm_response_headers, [response.headers])
+
         # Google AI uses `finishReason: "STOP` for all messages in the stream.
         # This field can't be used to terminate the list of deltas, so simulate
         # this behavior by forcing the final delta to have `status: :complete`.
@@ -382,33 +539,57 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     update_in(data, [Access.at(-1), Access.at(-1)], &%{&1 | status: :complete})
   end
 
-  def do_process_response(response, message_type \\ Message)
+  def do_process_response(model, response, message_type \\ Message)
 
-  def do_process_response(%{"candidates" => candidates}, message_type) when is_list(candidates) do
+  def do_process_response(model, %{"candidates" => candidates} = data, message_type)
+      when is_list(candidates) do
+    token_usage = get_token_usage(data)
+
+    case token_usage do
+      %TokenUsage{} = usage ->
+        Callbacks.fire(model.callbacks, :on_llm_token_usage, [usage])
+        :ok
+
+      nil ->
+        :ok
+    end
+
     candidates
-    |> Enum.map(&do_process_response(&1, message_type))
+    |> Enum.map(&do_process_response(model, &1, message_type))
+    |> Enum.map(&TokenUsage.set(&1, token_usage))
   end
 
-  def do_process_response(%{"content" => %{"parts" => parts} = content_data} = data, Message) do
+  def do_process_response(
+        model,
+        %{"content" => %{"parts" => parts} = content_data} = data,
+        Message
+      ) do
     text_part =
       parts
       |> filter_parts_for_types(["text"])
+      |> filter_text_parts()
       |> Enum.map(fn part ->
-        ContentPart.new!(%{type: :text, content: part["text"]})
+        type =
+          case part["thought"] do
+            true -> :thinking
+            _ -> :text
+          end
+
+        ContentPart.new!(%{type: type, content: part["text"]})
       end)
 
     tool_calls_from_parts =
       parts
       |> filter_parts_for_types(["functionCall"])
       |> Enum.map(fn part ->
-        do_process_response(part, nil)
+        do_process_response(model, part, nil)
       end)
 
     tool_result_from_parts =
       parts
       |> filter_parts_for_types(["functionResponse"])
       |> Enum.map(fn part ->
-        do_process_response(part, nil)
+        do_process_response(model, part, nil)
       end)
 
     %{
@@ -429,7 +610,11 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     end
   end
 
-  def do_process_response(%{"content" => %{"parts" => parts} = content_data} = data, MessageDelta) do
+  def do_process_response(
+        model,
+        %{"content" => %{"parts" => parts} = content_data} = data,
+        MessageDelta
+      ) do
     text_content =
       case parts do
         [%{"text" => text}] ->
@@ -449,7 +634,7 @@ defmodule LangChain.ChatModels.ChatVertexAI do
       parts
       |> filter_parts_for_types(["functionCall"])
       |> Enum.map(fn part ->
-        do_process_response(part, nil)
+        do_process_response(model, part, nil)
       end)
 
     %{
@@ -469,13 +654,22 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     end
   end
 
-  def do_process_response(%{"functionCall" => %{"args" => raw_args, "name" => name}} = data, _) do
+  def do_process_response(
+        _model,
+        %{"functionCall" => %{"args" => raw_args, "name" => name}} = data,
+        _
+      ) do
     %{
       call_id: "call-#{name}",
       name: name,
       arguments: raw_args,
       complete: true,
-      index: data["index"]
+      index: data["index"],
+      metadata:
+        if(data["thoughtSignature"],
+          do: %{thought_signature: data["thoughtSignature"]},
+          else: nil
+        )
     }
     |> ToolCall.new()
     |> case do
@@ -488,6 +682,7 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   end
 
   def do_process_response(
+        _model,
         %{
           "finishReason" => finish,
           "content" => %{"parts" => parts, "role" => role},
@@ -531,12 +726,12 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     end
   end
 
-  def do_process_response(%{"error" => %{"message" => reason}}, _) do
+  def do_process_response(_model, %{"error" => %{"message" => reason}} = response, _) do
     Logger.error("Received error from API: #{inspect(reason)}")
-    {:error, reason}
+    {:error, LangChainError.exception(message: reason, original: response)}
   end
 
-  def do_process_response({:error, %Jason.DecodeError{} = response}, _) do
+  def do_process_response(_model, {:error, %Jason.DecodeError{} = response}, _) do
     error_message = "Received invalid JSON: #{inspect(response)}"
     Logger.error(error_message)
 
@@ -544,17 +739,31 @@ defmodule LangChain.ChatModels.ChatVertexAI do
      LangChainError.exception(type: "invalid_json", message: error_message, original: response)}
   end
 
-  def do_process_response(other, _) do
+  def do_process_response(_model, other, _) do
     Logger.error("Trying to process an unexpected response. #{inspect(other)}")
 
     {:error,
-     LangChainError.exception(type: "unexpected_response", message: "Unexpected response")}
+     LangChainError.exception(
+       type: "unexpected_response",
+       message: "Unexpected response",
+       original: other
+     )}
   end
 
   @doc false
   def filter_parts_for_types(parts, types) when is_list(parts) and is_list(types) do
     Enum.filter(parts, fn p ->
       Enum.any?(types, &Map.has_key?(p, &1))
+    end)
+  end
+
+  @doc false
+  def filter_text_parts(parts) when is_list(parts) do
+    Enum.filter(parts, fn p ->
+      case p do
+        %{"text" => text} -> text && text != ""
+        _ -> false
+      end
     end)
   end
 
@@ -584,9 +793,34 @@ defmodule LangChain.ChatModels.ChatVertexAI do
     end
   end
 
+  defp get_token_usage(%{"usageMetadata" => usage} = _response_body) do
+    # extract out the reported response token usage
+    TokenUsage.new!(%{
+      input: Map.get(usage, "promptTokenCount", 0),
+      output: Map.get(usage, "candidatesTokenCount", 0),
+      raw: usage
+    })
+  end
+
+  defp get_token_usage(_response_body), do: nil
+
   defp unmap_role("model"), do: "assistant"
   defp unmap_role("function"), do: "tool"
   defp unmap_role(role), do: role
+
+  @doc """
+  Determine if an error should be retried. If `true`, a fallback LLM may be
+  used. If `false`, the error is understood to be more fundamental with the
+  request rather than a service issue and it should not be retried or fallback
+  to another service.
+  """
+  @impl ChatModel
+  @spec retry_on_fallback?(LangChainError.t()) :: boolean()
+  def retry_on_fallback?(%LangChainError{type: "rate_limited"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "rate_limit_exceeded"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "timeout"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "too_many_requests"}), do: true
+  def retry_on_fallback?(_), do: false
 
   @doc """
   Generate a config map that can later restore the model's configuration.
@@ -602,8 +836,10 @@ defmodule LangChain.ChatModels.ChatVertexAI do
         :temperature,
         :top_p,
         :top_k,
+        :thinking_config,
         :receive_timeout,
         :json_response,
+        :json_schema,
         :stream
       ],
       @current_config_version

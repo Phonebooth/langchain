@@ -1,5 +1,436 @@
 # Changelog
 
+## v0.5.1
+
+### Enhancements
+
+**Enhanced Tool Execution Callbacks**: Added four new callbacks that provide granular visibility into the complete tool execution lifecycle:
+
+1. **`:on_tool_call_identified`** - Fires as soon as a tool name is detected during streaming (before arguments are fully received). May not have `call_id` yet. Enables early UI feedback like "Searching web..." while the LLM is still streaming.
+
+2. **`:on_tool_execution_started`** - Fires immediately before tool execution begins. Always has `call_id`. Allows tracking when actual execution starts.
+
+3. **`:on_tool_execution_completed`** - Fires after successful tool execution with the result. Useful for logging, metrics, and updating UI state.
+
+4. **`:on_tool_execution_failed`** - Fires when a tool call fails, is invalid, or is rejected during human-in-the-loop approval. Includes error details.
+
+**Key distinction**: The early `:on_tool_call_identified` callback fires during streaming as soon as the tool name appears, while `:on_tool_execution_started` fires later when execution actually begins. This two-phase notification enables responsive UIs that can show immediate feedback.
+
+**Example usage**:
+
+```elixir
+callbacks = %{
+  on_tool_call_identified: fn _chain, tool_call, func ->
+    # Show early UI feedback during streaming (tool args may be incomplete)
+    IO.puts("Tool identified: #{func.display_text || tool_call.name}")
+  end,
+  on_tool_execution_started: fn _chain, tool_call, func ->
+    # Update UI when execution actually begins (tool args complete)
+    IO.puts("Executing: #{func.display_text || tool_call.name}")
+  end,
+  on_tool_execution_completed: fn _chain, tool_call, func, result ->
+    # Handle successful execution
+    IO.puts("Completed: #{tool_call.name}")
+  end,
+  on_tool_execution_failed: fn _chain, tool_call, func, error ->
+    # Handle failures
+    IO.puts("Failed: #{tool_call.name} - #{error}")
+  end
+}
+
+chain = LLMChain.new!(%{
+  llm: model,
+  tools: [my_tool],
+  callbacks: [callbacks]
+})
+```
+
+**Additional improvements**:
+- `MessageDelta` now tracks tool display information in metadata for better UI rendering
+- Callbacks fire correctly across all execution paths (normal, async, HITL workflows)
+- Internal tracking prevents duplicate identification notifications for the same tool call
+
+**Non-breaking change**: Existing applications continue to work without modifications. All new callbacks are optional.
+
+---
+
+## v0.5.0
+
+### Breaking Changes
+
+**Elixir 1.17+ Required**: This release requires Elixir 1.17 or higher. The library uses the `get_in` macro which is only available in Elixir 1.17 onwards. Using Elixir 1.16 will throw a compile error. https://github.com/brainlid/langchain/pull/427
+
+**Async Tool Timeout Default Changed**: The default timeout for async tools (tools with `async: true`) has changed from 2 minutes (`120_000` ms) to `:infinity` (no timeout).
+
+### Upgrading from v0.4.1 - v0.5.0
+
+#### Elixir Version Requirement
+
+**What changed**: Minimum Elixir version is now 1.17.
+
+**Who is affected**: Users running Elixir 1.16 or earlier.
+
+**How to migrate**: Upgrade to Elixir 1.17 or later.
+
+#### Async Tool Timeout Default Change
+
+**What changed**: The default timeout for async tools (tools with `async: true`) has changed from 2 minutes (`120_000` ms) to `:infinity` (no timeout).
+
+**Why**: The previous 2-minute default was problematic for human-interactive agents because:
+- Web research tools often take 3-5+ minutes
+- Sub-agent workflows can run indefinitely
+- Deep analysis tools may need extended processing time
+- Users observing the agent can manually stop it if needed
+
+**Who is affected**: If your application relied on the implicit 2-minute timeout to catch runaway tools, you will need to explicitly set a timeout.
+
+**How to migrate**:
+
+1. **If you were happy with the 2-minute timeout**, add this to your `config/runtime.exs`:
+
+       config :langchain, async_tool_timeout: 2 * 60 * 1000  # 2 minutes (previous default)
+
+2. **If you set an explicit `async_tool_timeout`**, no changes needed - your explicit value is still respected.
+
+3. **If the new `:infinity` default works for you** (human-interactive agents), no changes needed.
+
+**Configuration precedence** (highest to lowest):
+1. `LLMChain.async_tool_timeout` - explicit value on chain
+2. `Agent.async_tool_timeout` - passed through to chain when building
+3. `Application.get_env(:langchain, :async_tool_timeout)` - runtime config
+4. Library default - `:infinity`
+
+**Example configurations**:
+
+    # Application-level (config/runtime.exs)
+    config :langchain, async_tool_timeout: 5 * 60 * 1000  # 5 minutes
+
+    # Agent-level
+    {:ok, agent} = Agent.new(%{
+      model: model,
+      async_tool_timeout: 10 * 60 * 1000  # 10 minutes
+    })
+
+    # Chain-level
+    {:ok, chain} = LLMChain.new(%{
+      llm: model,
+      async_tool_timeout: 35 * 60 * 1000  # 35 minutes for Deep Research
+    })
+
+### Added
+- **Agent Framework Foundation**: Base work for new agent library with middleware-based architecture, including agent orchestration, state management, virtual filesystem, human-in-the-loop (HITL) workflows, sub-agents, summarization, and presence tracking https://github.com/brainlid/langchain/pull/442
+- **ChatOpenAIResponses**: Added `req_config` option for custom Req configuration https://github.com/brainlid/langchain/pull/415
+- **ChatOpenAIResponses**: Added reasoning/thinking events support https://github.com/brainlid/langchain/pull/421
+- **ChatOpenAIResponses**: Added new reasoning effort values https://github.com/brainlid/langchain/pull/419
+- **ChatOpenAIResponses**: Added stateful context support for Response API https://github.com/brainlid/langchain/pull/425
+- **ChatVertexAI**: Added JSON schema support https://github.com/brainlid/langchain/pull/424
+- **ChatVertexAI**: Added thinking configuration support https://github.com/brainlid/langchain/pull/423
+- **ChatGoogleAI**: Added `thought_signature` support for Gemini 3 function calls https://github.com/brainlid/langchain/pull/431
+- **ChatMistralAI**: Added support for parallel tool calls https://github.com/brainlid/langchain/pull/433
+- **ChatMistralAI**: Added thinking content parts support https://github.com/brainlid/langchain/pull/418
+- **ChatPerplexity and ChatMistralAI**: Added `verbose_api` field https://github.com/brainlid/langchain/pull/416
+- **LLMChain**: Changed default `async_tool_timeout` from 2 minutes to `:infinity` https://github.com/brainlid/langchain/pull/442
+
+### Changed
+- **Dependencies**: Updated Elixir requirement to `~> 1.17` https://github.com/brainlid/langchain/pull/427
+- **ChatOpenAIResponses**: Don't include `top_p` parameter for gpt-5.2+ models https://github.com/brainlid/langchain/pull/428
+
+### Fixed
+- **ChatDeepSeek**: Fixed UI bug in deepseek-chat model introduced by reasoning_content support https://github.com/brainlid/langchain/pull/429
+- **Core**: Fixed missing error handling and fallback mechanism on server outages https://github.com/brainlid/langchain/pull/435
+- **ChatOpenAIResponses**: Fixed image `file_id` content type handling https://github.com/brainlid/langchain/pull/438
+
+---
+
+## v0.4.1
+
+### Added
+- **ChatDeepSeek**: Added DeepSeek chat model integration with reasoning_content support (#394, #407)
+- **ChatOpenAI**: Added strict tool use support (#301)
+- **ChatOpenAI**: Added support for file_url with link to file (#395)
+- **ChatAnthropic**: Added strict tool use support (#409)
+- **ChatAnthropic**: Added support for file_url (#404)
+- **ChatAnthropic**: Added PDF reading support via Anthropic API (#403)
+- **ChatAnthropic**: Added `cache_messages` option to improve cache utilization (#398)
+- **ChatAnthropic**: Added `req_opts` option for custom Req configuration (#408)
+- **MessageDelta**: Added `MessageDelta.merge_deltas/2` function for merging multiple deltas (#401)
+- **ChatAnthropic**: Added `disable_parallel_tool_use` tool_choice pass-through (#390)
+- **Core**: Added multi-part tool responses support (#410)
+
+### Changed
+- **ChatOpenAI**: Enhanced OpenAI responses API (#391)
+- **Dependencies**: Updated gettext requirement to `~> 1.0` (#393, #399)
+- **Documentation**: Updated README install instructions
+
+### Fixed
+- **Core**: Fixed compiler typing warnings
+
+---
+
+## v0.4.0
+
+### Added
+- **ChatOpenAI**: Added support for json-schema in OpenAI responses API (#387)
+- **Documentation**: Added AGENTS.md and CLAUDE.md file support (#385)
+- **CI**: Added support for OTP 28 (#382)
+
+### Changed
+- **ChatOpenAI**: Enhanced OpenAI responses handling (#381)
+- **Documentation**: Use moduledoc instead of doc for LLMChain documentation (#384)
+- **Utils.ChainResult**: Added clarity to message stopped for length handling
+
+### Fixed
+- **ChatBumblebee**: Suppressed compiler warning messages when used as a dependency (#386)
+- **Core**: Fixed Ecto field formatting
+
+---
+
+## v0.4.0-rc.3
+
+### Added
+- **ChatOrqAI**: Added Orq AI chat model support (#377)
+- **ChatOpenAI**: Added OpenAI Deep Research integration (#336)
+- **ChatOpenAI**: Added `parallel_tool_calls` option (#371)
+- **ChatOpenAI**: Added `req_config` option for custom Req configuration (#376)
+- **ChatOpenAI**: Added verbosity parameter support (#379)
+- **ChatVertexAI**: Added support for native tool calls (#359)
+- **ChatGoogleAI**: Added full thinking configuration support (#375)
+- **Bedrock**: Added optional AWS session token handling in BedrockHelpers (#372)
+- **LLMChain**: Added `should_continue?` function for automatic looping on mode `:step` (#361)
+- **Core**: Added `retry_on_fallback?` to chat model definition and all models (#350)
+
+### Fixed
+- **Images**: Fixed handling of LiteLLM responses with null `b64_json` in OpenAI image generation (#368)
+- **Core**: Fixed handling of missing `finish_reason` in streaming responses for LiteLLM compatibility (#367)
+- **ChatGoogleAI**: Fixed error prevention from thinking content parts (#374)
+- **ChatGoogleAI**: Fixed handling of Gemini's cumulative token usage (#373)
+
+---
+
+## v0.4.0-rc.2
+
+### Added
+- **ChatGrok**: Added xAI Grok chat model support (#338)
+- **ChatGoogleAI**: Added thinking support (#354)
+- **ChatGoogleAI**: Added `req_config` option for custom Req configuration (#357)
+- **ChatOllamaAI**: Added missing `verbose_api` field for streaming compatibility (#341)
+- **ChatVertexAI**: Added usage data to Message response metadata (#335)
+- **Images**: Added support for `gpt-image-1` model in OpenAI image generation (#360)
+- **LLMChain**: Added new run mode `:step` for step-by-step execution (#343)
+- **LLMChain**: Added support for multiple tools in `run_until_tool_used` (#345)
+- **OpenAI**: Added organization ID as a parameter for API requests (#337)
+- New callback `on_llm_response_headers` supports receiving the full Req HTTP response headers for a request (#358)
+
+### Changed
+- **Bedrock**: Added OpenAI-compatible API compatibility (#356)
+- **ChatAnthropic**: Expanded logging for API errors (#349)
+- **ChatAnthropic**: Added transient Req retry support in stream mode (#329)
+- **ChatGoogleAI**: Cleaned up MessageDelta handling (#353)
+- **ChatOpenAI**: Only include "user" field with requests when a value is provided (#364)
+- **Dependencies**: Updated gettext requirement to `~> 0.26` (#332)
+
+### Fixed
+- **ChatGoogleAI**: Handle responses with no content parts (#365)
+- **ChatGoogleAI**: Prevent crash when ToolResult contains string content (#352)
+- **Core**: Fixed issue with poorly matching list in case statements (#334)
+- **Core**: Filter out empty lists in message responses (#333)
+
+### Breaking Changes
+- **ChatOllamaAI**: Fixed `stop` field type from `:string` to `{:array, :string}` to match Ollama API requirements. Previously, stop sequences were non-functional due to API type mismatch. Now accepts arrays like `["\\n", "Human:", "<|eot_id|>"]`. Empty arrays are excluded from API requests to preserve modelfile defaults (#342)
+
+---
+
+## v0.4.0-rc.1
+
+---
+
+### Breaking Changes
+- ToolResult `content` now supports a list of ContentParts, not just strings. Functions can return a ToolResult directly for advanced control (e.g., cache control, processed_content).
+- Expanded multi-modal support: messages and tool results can now include text, images, files, and thinking blocks as ContentParts.
+- LLMChain: Added `async_tool_timeout` config; improved fallback and error handling.
+- `LangChain.Function` changed the default for `async` to `false`. If you want async execution, set `async: true` explicitly when defining your function.
+- The `on_llm_new_delta` callback now receives a list of `MessageDelta` structs instead of a single one. To merge the received deltas into your chain for display, use:
+
+```elixir
+updated_chain = LLMChain.merge_deltas(current_llm_chain, deltas)
+```
+
+### Upgrading from v0.4.0-rc.0 - v0.4.0-rc.1
+- If you return a ToolResult from a function, you can now use ContentParts for richer responses. See module docs for details.
+- If you use custom chunking logic, see the new tokenizer support in TextSplitter.
+- If you are displaying streamed MessageDelta results using the `on_llm_new_delta` callback, you will need to update your callback function to expect a list of MessageDeltas and you can use the new `LLMChain.merge_deltas` function for merging them into your chain. The resulting merged delta can be used for display.
+
+#### Model Compatibility
+- The following models have been verified with this version:
+  - ChatOpenAI
+  - ChatAnthropic
+  - ChatGoogleAI
+- There are known broken live tests with Perplexity and likely others. Not all models are currently verified or supported in this release.
+
+**Assistance is requested** for verifying/updating other models and their tests.
+
+### Added
+- Telemetry to `LLMChain.run_until_tool_used` for better observability.
+- Google Gemini 2.0+ supports native Google Search as a tool.
+- MistralAI: Structured output support.
+- ChatGoogleAI: `verbose_api` option; updated default model to `gemini-2.5-pro`.
+- TextSplitter: Added configurable tokenizer support for chunking by tokens, not just characters.
+
+### Changed
+- ChatOpenAI: Improved handling of ContentParts in ToolResults; better support for reasoning models and robust API options.
+- ChatGoogleAI: Improved ToolResult handling for ContentParts; better error and token usage reporting.
+- ChatAnthropic: Expanded prompt caching support and documentation; improved error and token usage handling.
+- LLMChain: Improved fallback and error handling; added async tool timeout config.
+- TextSplitter: Now supports custom tokenizers for chunking.
+
+### Fixed
+- ToolCalls: Fixed issues with nil tool_calls and tool call processing.
+- Token Usage: Fixed token usage reporting for GoogleAI.
+- Bedrock Stream Decoder: Fixed chunk order issue.
+
+## v0.4.0-rc.0
+
+This includes several breaking changes:
+
+- Not all chat models are supported and updated yet. Currently only **OpenAI** and **Claude**
+- Assistant messages are all assumed to be a list of `ContentPart` structs, supporting text, thinking, and more in the future like images
+- A Message includes the TokenUsage in `Message.metadata.usage` after received.
+- To display a MessageDelta as it is being streamed back, use `MessageDelta.merged_content`.
+
+Use the v0.3.x releases for models that are not yet supported.
+
+| Model | v0.3.x | v0.4.x |
+|-------|---------|---------|
+| OpenAI ChatGPT | ✓ | ✓ |
+| OpenAI DALL-e 2 (image generation) | ✓ | ? |
+| Anthropic Claude | ✓ | ✓ |
+| Anthropic Claude (thinking) | X | ✓ |
+| Google Gemini | ✓ | ✓ |
+| Google Vertex AI | ✓ | ✓ |
+| Ollama | ✓ | ? |
+| Mistral | ✓ | X |
+| Bumblebee self-hosted models | ✓ | ? |
+| LMStudio | ✓ | ? |
+| Perplexity | ✓ | ? |
+
+### Upgrade from v0.3.3 to v0.4.x
+
+As LLM services get more advanced, they have begun returning multi-modal responses. For some time, they have been accepting multi-modal requests, meaning an image and text could be submitted at the same time.
+
+Now, LLMs have changed to return multi-modal responses. This means they may return text along with an image. This is currently most common with receiving a "thinking" response separate from their text response.
+
+In an effort to provide a consistent interface to many different LLMs, now **all** message responses with content (text, image, thinking, etc.) will be represented as a list of `ContentPart` structs.
+
+This is a breaking change and may require application updates to adapt.
+
+### Message Changes
+
+Where this was received before:
+
+```elixir
+%Message{content: "this is a string"}
+```
+
+This is received now:
+
+```elixir
+%Message{content: [%ContentPart{type: :text, content: "this is a string"}]}
+```
+
+This can be quickly turned back into plain text using `LangChain.Message.ContentPart.parts_to_string/1`.
+
+It looks like this:
+```elixir
+message = %Message{content: [%ContentPart{type: :text, content: "this is a string"}]}
+ContentPart.parts_to_string(message.content)
+#=> "this is a string"
+```
+
+This also handles if multiple text content parts are received:
+```elixir
+message = %Message{content: [
+  %ContentPart{type: :text, content: "this is a string"},
+  %ContentPart{type: :text, content: "this is another string"},
+]}
+ContentPart.parts_to_string(message.content)
+#=> "this is a string\n\nthisis another string"
+```
+
+For constructing your own messages, this is auto-converted for you:
+
+```elixir
+Message.new_user!("Howdy!")
+#=> %Message{role: :user, content: [%ContentPart{type: :text, content: "Howdy!"}]}
+```
+
+This can also be constructed like this:
+
+```elixir
+Message.new_user!([ContentPart.text!("Howdy!")])
+#=> %Message{role: :user, content: [%ContentPart{type: :text, content: "Howdy!"}]}
+```
+
+The change is more significant when handling an assistant response message.
+
+### MessageDelta Changes
+
+When streaming a response and getting back `MessageDelta`s, these now have a `merged_content` field that combines the different streamed back content types into their complete pieces. These pieces can represent different indexes in the list of received ContentParts.
+
+See the MessageDelta module docs for more information on `merged_content`.
+
+This is important because when needing to display the deltas as they are being received, it is now the `merged_content` field that should be used.
+
+### TokenUsage
+
+Another significant change is the moving of TokenUsage from a separated callback to being directly attached to a Message's `metadata`. Token usage is accumulated, as it is split out typically on the first and last delta's received.
+
+After an LLMChain.run, the `updated_chain.last_message.metadata.usage` will contain the %TokenUsage{} information.
+
+A related change was to move the TokenUsage callback from the OpenAI and Anthropic chat models to the LLMChain. This means the same event will fire, but it will fire when it's fully received and assembled.
+
+
+
+## v0.3.3 (2025-03-17)
+
+This is a milestone release before staring v0.4.0 which introduces breaking changes, but importantly adds support for "thinking" models.
+
+### Added
+- Added telemetry support https://github.com/brainlid/langchain/pull/284
+- Added `LLMChain.run_until_tool_used/3` function https://github.com/brainlid/langchain/pull/292
+- Support for file uploads with file_id in ChatOpenAI https://github.com/brainlid/langchain/pull/283
+- Support for json_response in ChatGoogleAI https://github.com/brainlid/langchain/pull/277
+- Support for streaming responses from Mistral https://github.com/brainlid/langchain/pull/287
+- Support for file URLs in Google AI https://github.com/brainlid/langchain/pull/286
+- Support for PDF content with OpenAI model https://github.com/brainlid/langchain/pull/275
+- Support for caching tool results in Anthropic calls https://github.com/brainlid/langchain/pull/269
+- Support for choosing Anthropic beta headers https://github.com/brainlid/langchain/pull/273
+
+### Changed
+- Fixed options being passed to the Ollama chat API https://github.com/brainlid/langchain/pull/179
+- Fixed media URIs for Google Vertex https://github.com/brainlid/langchain/pull/242
+- Fixed OpenAI verbose_api https://github.com/brainlid/langchain/pull/274
+- Improved documentation for callbacks and content parts
+- Upgraded gettext and migrated https://github.com/brainlid/langchain/pull/271
+
+### Fixed
+- Added validation to check if requested tool_name exists in chain
+- Fixed various documentation issues and typos
+- Fixed callback links in documentation
+
+## v0.3.2 (2025-03-17)
+
+### Added
+- Support for Perplexity AI https://github.com/brainlid/langchain/pull/261
+- Enable tool support for ollama (if the model supports it and only when not streaming) https://github.com/brainlid/langchain/pull/164
+- Added `on_message_processed` callback when tool response is created: When a Tool response message is created, it already fired an on_tool_response_created, but it now also fires the more general on_message_processed, because a tool result can certainly be considered being processed. https://github.com/brainlid/langchain/pull/248
+- Added Tool Calls and TokenUsage for Mistral.ai https://github.com/brainlid/langchain/pull/253
+- Added `LangChain.TextSplitter` with character and recursive character splitting support https://github.com/brainlid/langchain/pull/256
+- Add native tool functionality (e.g. `google_search` for Gemini) https://github.com/brainlid/langchain/pull/250
+
+### Changes
+- Improved System instruction support for Vertex AI https://github.com/brainlid/langchain/pull/260
+- Redact api-key from models when logged https://github.com/brainlid/langchain/pull/266
+
 ## v0.3.1 (2025-02-05)
 
 ### Added

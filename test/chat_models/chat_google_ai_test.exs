@@ -14,6 +14,8 @@ defmodule ChatModels.ChatGoogleAITest do
   alias LangChain.LangChainError
   alias LangChain.ChatModels.ChatGoogleAI
 
+  @test_model "gemini-2.5-flash"
+
   setup do
     {:ok, hello_world} =
       Function.new(%{
@@ -29,8 +31,8 @@ defmodule ChatModels.ChatGoogleAITest do
 
   describe "new/1" do
     test "works with minimal attr" do
-      assert {:ok, %ChatGoogleAI{} = google_ai} = ChatGoogleAI.new(%{"model" => "gemini-pro"})
-      assert google_ai.model == "gemini-pro"
+      assert {:ok, %ChatGoogleAI{} = google_ai} = ChatGoogleAI.new(%{"model" => @test_model})
+      assert google_ai.model == @test_model
     end
 
     test "returns error when invalid" do
@@ -60,19 +62,40 @@ defmodule ChatModels.ChatGoogleAITest do
 
       assert model.api_version == api_version
     end
+
+    test "supports setting json_response and json_schema" do
+      json_schema = %{
+        "type" => "object",
+        "properties" => %{
+          "name" => %{"type" => "string"},
+          "age" => %{"type" => "integer"}
+        }
+      }
+
+      {:ok, google_ai} =
+        ChatGoogleAI.new(%{
+          "model" => @test_model,
+          "json_response" => true,
+          "json_schema" => json_schema
+        })
+
+      assert google_ai.json_response == true
+      assert google_ai.json_schema == json_schema
+    end
   end
 
   describe "for_api/3" do
     setup do
-      {:ok, google_ai} =
-        ChatGoogleAI.new(%{
-          "model" => "gemini-pro",
-          "temperature" => 1.0,
-          "top_p" => 1.0,
-          "top_k" => 1.0
-        })
+      params = %{
+        "model" => @test_model,
+        "temperature" => 1.0,
+        "top_p" => 1.0,
+        "top_k" => 1.0
+      }
 
-      %{google_ai: google_ai}
+      {:ok, google_ai} = ChatGoogleAI.new(params)
+
+      %{google_ai: google_ai, params: params}
     end
 
     test "generates a map for an API call", %{google_ai: google_ai} do
@@ -96,8 +119,24 @@ defmodule ChatModels.ChatGoogleAITest do
         )
 
       assert %{"contents" => [msg1, msg2]} = data
-      assert %{"role" => :user, "parts" => [%{"text" => ^user_message}]} = msg1
-      assert %{"role" => :model, "parts" => [%{"text" => ^assistant_message}]} = msg2
+      assert %{"role" => "user", "parts" => [%{"text" => ^user_message}]} = msg1
+      assert %{"role" => "model", "parts" => [%{"text" => ^assistant_message}]} = msg2
+    end
+
+    test "generated a map containing response_mime_type and response_schema", %{params: params} do
+      google_ai =
+        params
+        |> Map.merge(%{"json_response" => true, "json_schema" => %{"type" => "object"}})
+        |> ChatGoogleAI.new!()
+
+      data = ChatGoogleAI.for_api(google_ai, [], [])
+
+      assert %{
+               "generationConfig" => %{
+                 "response_mime_type" => "application/json",
+                 "response_schema" => %{"type" => "object"}
+               }
+             } = data
     end
 
     test "generates a map containing function and function call messages", %{google_ai: google_ai} do
@@ -133,9 +172,9 @@ defmodule ChatModels.ChatGoogleAITest do
         )
 
       assert %{"contents" => [msg1, msg2, msg3]} = data
-      assert %{"role" => :user, "parts" => [%{"text" => ^message}]} = msg1
-      assert %{"role" => :model, "parts" => [tool_call]} = msg2
-      assert %{"role" => :function, "parts" => [tool_result]} = msg3
+      assert %{"role" => "user", "parts" => [%{"text" => ^message}]} = msg1
+      assert %{"role" => "model", "parts" => [tool_call]} = msg2
+      assert %{"role" => "model", "parts" => [tool_result]} = msg3
 
       assert %{
                "functionCall" => %{
@@ -155,7 +194,36 @@ defmodule ChatModels.ChatGoogleAITest do
              } = tool_result
     end
 
-    test "generate a map containing a text and an image part (bug #209)", %{google_ai: google_ai} do
+    test "for_api includes thoughtSignature when present in ToolCall metadata" do
+      tool_call =
+        ToolCall.new!(%{
+          call_id: "call_123",
+          name: "test_function",
+          arguments: %{"arg" => "value"},
+          metadata: %{thought_signature: "sig_abc123"}
+        })
+
+      result = ChatGoogleAI.for_api(tool_call)
+
+      assert result["thoughtSignature"] == "sig_abc123"
+      assert result["functionCall"]["name"] == "test_function"
+    end
+
+    test "for_api excludes thoughtSignature when not in ToolCall metadata" do
+      tool_call =
+        ToolCall.new!(%{
+          call_id: "call_123",
+          name: "test_function",
+          arguments: %{"arg" => "value"}
+        })
+
+      result = ChatGoogleAI.for_api(tool_call)
+
+      refute Map.has_key?(result, "thoughtSignature")
+      assert Map.has_key?(result, "functionCall")
+    end
+
+    test "generate a map containing text and inline image parts", %{google_ai: google_ai} do
       messages = [
         %LangChain.Message{
           content:
@@ -199,7 +267,7 @@ defmodule ChatModels.ChatGoogleAITest do
     test "translates a Message with function results to the expected structure" do
       expected =
         %{
-          "role" => :function,
+          "role" => "model",
           "parts" => [
             %{
               "functionResponse" => %{
@@ -250,15 +318,7 @@ defmodule ChatModels.ChatGoogleAITest do
           "name" => "find_theaters",
           "response" => %{
             "name" => "find_theaters",
-            "content" => %{
-              "movie" => "Barbie",
-              "theaters" => [
-                %{
-                  "name" => "AMC",
-                  "address" => "2000 W El Camino Real"
-                }
-              ]
-            }
+            "content" => %{"result" => "I don't know where the theaters are."}
           }
         }
       }
@@ -267,16 +327,7 @@ defmodule ChatModels.ChatGoogleAITest do
         ToolResult.new!(%{
           name: "find_theaters",
           tool_call_id: "call-find_theaters",
-          content:
-            Jason.encode!(%{
-              "movie" => "Barbie",
-              "theaters" => [
-                %{
-                  "name" => "AMC",
-                  "address" => "2000 W El Camino Real"
-                }
-              ]
-            })
+          content: "I don't know where the theaters are."
         })
 
       assert expected == ChatGoogleAI.for_api(tool_result)
@@ -309,6 +360,33 @@ defmodule ChatModels.ChatGoogleAITest do
     test "does not add system instruction if not present", %{google_ai: google_ai} do
       data = ChatGoogleAI.for_api(google_ai, [Message.new_user!("Hello!")], [])
       refute Map.has_key?(data, "system_instruction")
+    end
+
+    test "support file_url", %{google_ai: google_ai} do
+      message =
+        Message.new_user!([
+          ContentPart.text!("User prompt"),
+          ContentPart.file_url!("example.com/test.pdf", media: "application/pdf")
+        ])
+
+      data = ChatGoogleAI.for_api(google_ai, [message], [])
+
+      assert %{
+               "contents" => [
+                 %{
+                   "parts" => [
+                     %{"text" => "User prompt"},
+                     %{
+                       "file_data" => %{
+                         "file_uri" => "example.com/test.pdf",
+                         "mime_type" => "application/pdf"
+                       }
+                     }
+                   ],
+                   "role" => "user"
+                 }
+               ]
+             } = data
     end
 
     test "raises an error if more than one system message is present", %{google_ai: google_ai} do
@@ -474,6 +552,69 @@ defmodule ChatModels.ChatGoogleAITest do
       assert call.arguments == %{"value" => 123}
     end
 
+    test "handles function calls with thoughtSignature (Gemini 3)", %{model: model} do
+      response = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "role" => "model",
+              "parts" => [
+                %{
+                  "functionCall" => %{"args" => %{"key" => "value"}, "name" => "my_func"},
+                  "thoughtSignature" => "gemini3_thought_sig_xyz"
+                }
+              ]
+            },
+            "finishReason" => "STOP",
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [%Message{} = msg] = ChatGoogleAI.do_process_response(model, response)
+      assert [%ToolCall{} = call] = msg.tool_calls
+      assert call.metadata.thought_signature == "gemini3_thought_sig_xyz"
+      assert call.name == "my_func"
+    end
+
+    test "handles function calls without thoughtSignature", %{model: model} do
+      response = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "role" => "model",
+              "parts" => [%{"functionCall" => %{"args" => %{}, "name" => "my_func"}}]
+            },
+            "finishReason" => "STOP",
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [%Message{} = msg] = ChatGoogleAI.do_process_response(model, response)
+      assert [%ToolCall{} = call] = msg.tool_calls
+      assert call.metadata == nil
+    end
+
+    test "handles no parts in content", %{model: model} do
+      response = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "role" => "model"
+            },
+            "finishReason" => "STOP",
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [%Message{} = struct] = ChatGoogleAI.do_process_response(model, response)
+      assert struct.role == :assistant
+      assert struct.content == []
+      assert struct.status == :complete
+    end
+
     test "handles receiving MessageDeltas as well", %{model: model} do
       response = %{
         "candidates" => [
@@ -492,9 +633,9 @@ defmodule ChatModels.ChatGoogleAITest do
                ChatGoogleAI.do_process_response(model, response, MessageDelta)
 
       assert struct.role == :assistant
-      assert struct.content == "This is the first part of a mes"
+      assert struct.content == ContentPart.text!("This is the first part of a mes")
       assert struct.index == 0
-      assert struct.status == :incomplete
+      assert struct.status == :complete
     end
 
     test "handles receiving a MessageDelta with an empty text part", %{model: model} do
@@ -514,7 +655,28 @@ defmodule ChatModels.ChatGoogleAITest do
       assert [%MessageDelta{} = struct] =
                ChatGoogleAI.do_process_response(model, response, MessageDelta)
 
-      assert struct.content == ""
+      assert struct.content == ContentPart.text!("")
+    end
+
+    test "handles receiving a MessageDelta with no parts in content", %{model: model} do
+      response = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "role" => "model"
+            },
+            "finishReason" => "STOP",
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [%MessageDelta{} = struct] =
+               ChatGoogleAI.do_process_response(model, response, MessageDelta)
+
+      assert struct.role == :assistant
+      assert struct.content == nil
+      assert struct.status == :complete
     end
 
     test "handles API error messages", %{model: model} do
@@ -551,6 +713,79 @@ defmodule ChatModels.ChatGoogleAITest do
 
       assert error.type == "unexpected_response"
       assert error.message == "Unexpected response"
+    end
+
+    test "handles receiving a message with token usage", %{model: model} do
+      response = %{
+        "candidates" => [
+          %{
+            "content" => %{"role" => "model", "parts" => [%{"text" => "Hello User!"}]},
+            "finishReason" => "STOP",
+            "index" => 0
+          }
+        ],
+        "usageMetadata" => %{
+          "promptTokenCount" => 10,
+          "candidatesTokenCount" => 5,
+          "totalTokenCount" => 15
+        }
+      }
+
+      assert [%Message{} = struct] = ChatGoogleAI.do_process_response(model, response)
+      assert struct.role == :assistant
+      [%ContentPart{type: :text, content: "Hello User!"}] = struct.content
+      assert struct.index == 0
+      assert struct.status == :complete
+
+      # Verify that token usage is properly included in metadata
+      assert %TokenUsage{} = struct.metadata.usage
+      assert struct.metadata.usage.input == 10
+      assert struct.metadata.usage.output == 5
+
+      assert struct.metadata.usage.raw == %{
+               "promptTokenCount" => 10,
+               "candidatesTokenCount" => 5,
+               "totalTokenCount" => 15
+             }
+    end
+
+    test "handles receiving MessageDelta with token usage", %{model: model} do
+      response = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "role" => "model",
+              "parts" => [%{"text" => "This is a partial message"}]
+            },
+            "finishReason" => "STOP",
+            "index" => 0
+          }
+        ],
+        "usageMetadata" => %{
+          "promptTokenCount" => 8,
+          "candidatesTokenCount" => 3,
+          "totalTokenCount" => 11
+        }
+      }
+
+      assert [%MessageDelta{} = struct] =
+               ChatGoogleAI.do_process_response(model, response, MessageDelta)
+
+      assert struct.role == :assistant
+      assert struct.content == ContentPart.text!("This is a partial message")
+      assert struct.index == 0
+      assert struct.status == :complete
+
+      # Verify that token usage is properly included in metadata
+      assert %TokenUsage{} = struct.metadata.usage
+      assert struct.metadata.usage.input == 8
+      assert struct.metadata.usage.output == 3
+
+      assert struct.metadata.usage.raw == %{
+               "promptTokenCount" => 8,
+               "candidatesTokenCount" => 3,
+               "totalTokenCount" => 11
+             }
     end
   end
 
@@ -630,7 +865,7 @@ defmodule ChatModels.ChatGoogleAITest do
 
   describe "serialize_config/2" do
     test "does not include the API key or callbacks" do
-      model = ChatGoogleAI.new!(%{model: "gpt-4o"})
+      model = ChatGoogleAI.new!(%{model: @test_model})
       result = ChatGoogleAI.serialize_config(model)
       assert result["version"] == 1
       refute Map.has_key?(result, "api_key")
@@ -655,13 +890,16 @@ defmodule ChatModels.ChatGoogleAITest do
                "model" => "gemini-1.5-flash",
                "module" => "Elixir.LangChain.ChatModels.ChatGoogleAI",
                "receive_timeout" => 60000,
+               "thinking_config" => nil,
                "stream" => false,
                "temperature" => 0.0,
                "version" => 1,
                "api_version" => "v1beta",
                "top_k" => 1.0,
                "top_p" => 1.0,
-               "safety_settings" => []
+               "safety_settings" => [],
+               "json_response" => false,
+               "json_schema" => nil
              }
     end
   end
@@ -685,7 +923,8 @@ defmodule ChatModels.ChatGoogleAITest do
         end
       }
 
-      chat =
+      %ChatGoogleAI{} =
+        chat =
         ChatGoogleAI.new!(%{
           temperature: 0,
           stream: false
@@ -699,21 +938,27 @@ defmodule ChatModels.ChatGoogleAITest do
         ])
 
       # returns a list of MessageDeltas. A list of a list because it's "n" choices.
-      assert result == [
+      assert [
                %Message{
                  content: [
                    %Message.ContentPart{
                      type: :text,
                      content: "Colorful Threads",
-                     options: nil
+                     options: []
                    }
                  ],
                  status: :complete,
                  role: :assistant,
                  index: 0,
-                 tool_calls: []
+                 tool_calls: [],
+                 metadata: %{
+                   usage: %TokenUsage{
+                     input: 8,
+                     output: 2
+                   }
+                 }
                }
-             ]
+             ] = result
 
       assert_received {:fired_token_usage, usage}
       assert %TokenUsage{input: 8, output: 2} = usage
@@ -731,7 +976,8 @@ defmodule ChatModels.ChatGoogleAITest do
         end
       }
 
-      chat =
+      %ChatGoogleAI{} =
+        chat =
         ChatGoogleAI.new!(%{
           temperature: 0,
           stream: true
@@ -744,20 +990,48 @@ defmodule ChatModels.ChatGoogleAITest do
           Message.new_user!("Return the response 'Colorful Threads'.")
         ])
 
-      assert result == [
+      assert [
                [
                  %MessageDelta{
                    content: "Colorful Threads",
                    status: :complete,
                    index: 0,
                    role: :assistant,
-                   tool_calls: nil
+                   tool_calls: nil,
+                   metadata: %{
+                     usage: %TokenUsage{
+                       input: 8,
+                       output: 2
+                     }
+                   }
                  }
                ]
-             ]
+             ] = result
 
       assert_received {:fired_token_usage, usage}
       assert %TokenUsage{input: 8, output: 2} = usage
+    end
+  end
+
+  describe "google_search native tool" do
+    @tag live_call: true, live_google_ai: true
+    test "should include grounding metadata in response" do
+      alias LangChain.Chains.LLMChain
+      alias LangChain.Message
+      alias LangChain.NativeTool
+
+      model = ChatGoogleAI.new!(%{temperature: 0, stream: false, model: "gemini-2.0-flash"})
+
+      {:ok, updated_chain} =
+        %{llm: model, verbose: false, stream: false}
+        |> LLMChain.new!()
+        |> LLMChain.add_message(Message.new_user!("What is the current Google stock price?"))
+        |> LLMChain.add_tools(NativeTool.new!(%{name: "google_search", configuration: %{}}))
+        |> LLMChain.run()
+
+      assert %Message{} = updated_chain.last_message
+      assert updated_chain.last_message.role == :assistant
+      assert Map.has_key?(updated_chain.last_message.metadata, "groundingChunks")
     end
   end
 
@@ -809,7 +1083,8 @@ defmodule ChatModels.ChatGoogleAITest do
       # the function result message
       assert_received {:callback_tool_msg, message}
       assert message.role == :tool
-      assert [%ToolResult{content: "200"}] = message.tool_results
+      assert [%ToolResult{content: answer}] = message.tool_results
+      assert ContentPart.content_to_string(answer) == "200"
 
       assert_received {:callback_msg, message}
       assert message.role == :assistant
@@ -842,5 +1117,16 @@ defmodule ChatModels.ChatGoogleAITest do
 
     {:ok, string} = ChainResult.to_string(updated_chain)
     assert string =~ "owl"
+  end
+
+  describe "inspect" do
+    test "redacts the API key" do
+      chain = ChatGoogleAI.new!()
+
+      changeset = Ecto.Changeset.cast(chain, %{api_key: "1234567890"}, [:api_key])
+
+      refute inspect(changeset) =~ "1234567890"
+      assert inspect(changeset) =~ "**redacted**"
+    end
   end
 end
